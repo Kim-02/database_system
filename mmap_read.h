@@ -161,6 +161,7 @@ int mmap_read(const char* fileName){
     }
     if (blk.header.record_count > 0) {
         flush_block_stdout(&blk, &ri);
+        total_blocks_flushed++; // 마지막 블록 i/o 카운트 추가
     }
     double t1 = now_ns();
     double elapsed_s = (t1 - t0) / 1e9;
