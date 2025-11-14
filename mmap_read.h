@@ -86,11 +86,25 @@ static inline double now_ns(void) {
 
 int mmap_read(const char* fileName){
     int fd = open(fileName, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1; 
+    }
+
     struct stat st;
-    fstat(fd,&st);
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return 1;
+    }
 
     size_t filesize = (size_t)st.st_size;
-    char* base = mmap(NULL,filesize,PROT_READ,MAP_PRIVATE,fd,0);
+    char* base = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        return 1;
+    }
     close(fd);
     //block setting
     
