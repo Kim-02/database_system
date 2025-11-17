@@ -86,11 +86,25 @@ static inline double now_ns(void) {
 
 int mmap_read(const char* fileName){
     int fd = open(fileName, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1; 
+    }
+
     struct stat st;
-    fstat(fd,&st);
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return 1;
+    }
 
     size_t filesize = (size_t)st.st_size;
-    char* base = mmap(NULL,filesize,PROT_READ,MAP_PRIVATE,fd,0);
+    char* base = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        return 1;
+    }
     close(fd);
     //block setting
     
@@ -147,6 +161,7 @@ int mmap_read(const char* fileName){
     }
     if (blk.header.record_count > 0) {
         flush_block_stdout(&blk, &ri);
+        total_blocks_flushed++; // 마지막 블록 i/o 카운트 추가
     }
     double t1 = now_ns();
     double elapsed_s = (t1 - t0) / 1e9;
