@@ -12,3 +12,4 @@ main.o: main.c table_split.h
 
 clean:
 	rm -f *.o $(TARGET)
+	rm -f *.dat
