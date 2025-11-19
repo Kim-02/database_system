@@ -1,0 +1,7 @@
+*.o
+main
+main.out
+.vscode/
+join.txt
+part.tbl
+partsupp.tbl
