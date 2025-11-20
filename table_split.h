@@ -8,6 +8,7 @@
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
+#include "time_utils.h"
 
 // change page size (예: 1024, 2048, 4096 등으로 바꿔가며 실험)
 #define PAGESIZE 4096
@@ -62,15 +63,6 @@ static inline void recindex_add(RecIndex *ri, uint32_t off, uint16_t len) {
 }
 
 /*
- clock utils
-*/
-static inline double now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
-}
-
-/*
  * 입력 경로에서 파일 이름(basename)만 추출
  * 예: "/path/to/orders.tbl" -> "orders.tbl"
  */
@@ -94,11 +86,11 @@ static int flush_block_to_paged_file(const Block *b, int out_fd) {
 }
 
 /*
- * 비신장 가변길이 블로킹 + read() 기반 splitter (A안)
- * - 입력 파일의 레코드들을 Block 단위로 채우고
+ * 비신장 가변길이 블로킹 + read() 기반 splitter (방법 A)
+ * - 입력 파일의 레코드(한 줄)를 Block 단위로 채우되
+ *   각 레코드를 '\n' 포함해서 저장한다.
  * - Block 하나당 PAGESIZE 바이트짜리 Block 구조체를
  *   하나의 paged 파일에 연속해서 기록
- * - 나중에는 block_id * sizeof(Block) 오프셋으로 random access 가능
  */
 int split_by_pagesize(const char* fileName)
 {
@@ -175,17 +167,20 @@ int split_by_pagesize(const char* fileName)
                 }
 
                 if (len > 0) {
-                    if (len > max_payload) {
+                    // *** 변경점 1: 블록에 저장할 길이는 레코드 + '\n' 포함 ***
+                    size_t store_len = len + 1;  // '\n' 포함
+
+                    if (store_len > max_payload) {
                         fprintf(stderr,
-                            "Error: record (%zu B) exceeds page payload (%zu B)\n",
-                            len, max_payload);
+                            "Error: record (%zu B, with \\n) exceeds page payload (%zu B)\n",
+                            store_len, max_payload);
                         close(fd);
                         close(out_fd);
                         return 2;
                     }
 
                     // 현재 Block에 안 들어가면, 기존 Block을 paged 파일에 flush
-                    if (!block_can_fit(&blk, len)) {
+                    if (!block_can_fit(&blk, store_len)) {
                         if (blk.header.record_count > 0) {
                             if (flush_block_to_paged_file(&blk, out_fd) < 0) {
                                 close(fd);
@@ -198,15 +193,16 @@ int split_by_pagesize(const char* fileName)
                         recindex_reset(&ri);
                     }
 
-                    // Block에 레코드 추가
+                    // Block에 레코드 추가 (문자열 + '\n')
                     uint32_t off = (uint32_t)block_used(&blk);
                     memcpy(blk.data + off, recbuf, len);
-                    blk.header.remaining_space -= (uint16_t)len;
+                    blk.data[off + len] = '\n';                // *** 변경점 2 ***
+                    blk.header.remaining_space -= (uint16_t)store_len;
                     blk.header.record_count += 1;
-                    recindex_add(&ri, off, (uint16_t)len); // 현재는 메모리 내에서만 사용
+                    recindex_add(&ri, off, (uint16_t)store_len);
 
                     total_records++;
-                    total_payload_bytes += (uint64_t)len;
+                    total_payload_bytes += (uint64_t)store_len;
                 }
 
                 rec_len = 0;
@@ -233,16 +229,18 @@ int split_by_pagesize(const char* fileName)
         }
 
         if (len > 0) {
-            if (len > max_payload) {
+            size_t store_len = len + 1;  // '\n' 포함
+
+            if (store_len > max_payload) {
                 fprintf(stderr,
-                    "Error: record (%zu B) exceeds page payload (%zu B)\n",
-                    len, max_payload);
+                    "Error: record (%zu B, with \\n) exceeds page payload (%zu B)\n",
+                    store_len, max_payload);
                 close(fd);
                 close(out_fd);
                 return 2;
             }
 
-            if (!block_can_fit(&blk, len)) {
+            if (!block_can_fit(&blk, store_len)) {
                 if (blk.header.record_count > 0) {
                     if (flush_block_to_paged_file(&blk, out_fd) < 0) {
                         close(fd);
@@ -257,12 +255,13 @@ int split_by_pagesize(const char* fileName)
 
             uint32_t off = (uint32_t)block_used(&blk);
             memcpy(blk.data + off, recbuf, len);
-            blk.header.remaining_space -= (uint16_t)len;
+            blk.data[off + len] = '\n';     // 마지막 레코드도 '\n' 붙여서 저장
+            blk.header.remaining_space -= (uint16_t)store_len;
             blk.header.record_count += 1;
-            recindex_add(&ri, off, (uint16_t)len);
+            recindex_add(&ri, off, (uint16_t)store_len);
 
             total_records++;
-            total_payload_bytes += (uint64_t)len;
+            total_payload_bytes += (uint64_t)store_len;
         }
 
         rec_len = 0;
