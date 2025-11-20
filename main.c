@@ -59,10 +59,22 @@ int main(int argc, char *argv[]) {
 
     printf("========== STATS ==========\n");
     printf("Elapsed time : %.6f seconds\n", elapsed);
+    printf("  Read time  : %.6f seconds\n", g_time_read);
+    printf("  Join time  : %.6f seconds\n", g_time_join);
+    printf("  Write time : %.6f seconds\n", g_time_write);
     printf("Big alloc    : %zu bytes (blocks etc.)\n", g_big_alloc_bytes);
     printf("Max RSS      : %ld KB (OS reported)\n", max_rss_kb);
     printf("Left blocks  : %d\n", left_blocks);
     printf("Right blocks : %d\n", right_blocks);
+
+    double mem_used_pct = 0.0;
+    if (g_max_memory_bytes > 0) {
+        mem_used_pct =
+            100.0 * (double)g_big_alloc_bytes / (double)g_max_memory_bytes;
+    }
+    printf("Memory usage : %zu / %zu bytes (%.2f%%)\n",
+           g_big_alloc_bytes, g_max_memory_bytes, mem_used_pct);
+
     printf("Output file  : join.txt\n");
 
     return 0;

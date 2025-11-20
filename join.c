@@ -2,10 +2,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include "memory.h"
 #include "table.h"
 #include "blockio.h"
 #include "join.h"
+/* ==== 조인 단계별 시간 측정용 전역 변수 ==== */
+double g_time_read  = 0.0;
+double g_time_join  = 0.0;
+double g_time_write = 0.0;
+static double diff_sec(const struct timespec *start,
+                       const struct timespec *end)
+{
+    return (end->tv_sec  - start->tv_sec)
+         + (end->tv_nsec - start->tv_nsec) / 1e9;
+}
 
 void left_join_strategyB(const Table *left,
                          const Table *right,
@@ -15,6 +26,9 @@ void left_join_strategyB(const Table *left,
 {
     size_t B_L = left->block_size;
     size_t B_R = right->block_size;
+
+    struct timespec tj_start, tj_end;
+    clock_gettime(CLOCK_MONOTONIC, &tj_start);
 
     if (g_max_memory_bytes > 0 && g_max_memory_bytes < B_L + B_R) {
         fprintf(stderr,
@@ -102,10 +116,19 @@ void left_join_strategyB(const Table *left,
 
     int left_count;
 
-    while (fill_block(lf, B_L,
-                      left_blk, left_recs, &left_count, &pendL,
-                      max_left_recs))
-    {
+    /* 외부 루프: 왼쪽 테이블을 블록 단위로 1개씩 처리 */
+    while (1) {
+        struct timespec tr1, tr2;
+        clock_gettime(CLOCK_MONOTONIC, &tr1);
+        int ok_left = fill_block(lf, B_L,
+                                 left_blk, left_recs, &left_count, &pendL,
+                                 max_left_recs);
+        clock_gettime(CLOCK_MONOTONIC, &tr2);
+        g_time_read += diff_sec(&tr1, &tr2);
+
+        if (!ok_left) {
+            break;
+        }
         if (left_count == 0) {
             break;
         }
@@ -127,17 +150,23 @@ void left_join_strategyB(const Table *left,
         while (1) {
             int loaded_blocks = 0;
 
+            /* 오른쪽에서 최대 max_right_blocks 개의 블록을 메모리에 채움 */
             for (int bi = 0; bi < max_right_blocks; bi++) {
                 int rcnt;
                 char **rec_ptrs_for_block =
                     &right_recs[bi * max_right_recs];
 
+                struct timespec tr1, tr2;
+                clock_gettime(CLOCK_MONOTONIC, &tr1);
                 int ok = fill_block(rf, B_R,
                                     right_blks[bi],
                                     rec_ptrs_for_block,
                                     &rcnt,
                                     &pendR,
                                     max_right_recs);
+                clock_gettime(CLOCK_MONOTONIC, &tr2);
+                g_time_read += diff_sec(&tr1, &tr2);
+
                 if (!ok) {
                     break;
                 }
@@ -176,7 +205,13 @@ void left_join_strategyB(const Table *left,
                                                 recR,
                                                 right_nonkey,
                                                 sizeof(right_nonkey));
+
+                            struct timespec tw1, tw2;
+                            clock_gettime(CLOCK_MONOTONIC, &tw1);
                             fprintf(out, "%s%s\n", left_recs[i], right_nonkey);
+                            clock_gettime(CLOCK_MONOTONIC, &tw2);
+                            g_time_write += diff_sec(&tw1, &tw2);
+
                             matched[i] = 1;
                         }
                     }
@@ -192,11 +227,17 @@ void left_join_strategyB(const Table *left,
         int nonkey_cnt = right->header.num_columns - 1;
         for (int i = 0; i < left_count; i++) {
             if (!matched[i]) {
+                struct timespec tw1, tw2;
+                clock_gettime(CLOCK_MONOTONIC, &tw1);
+
                 fprintf(out, "%s", left_recs[i]);
                 for (int k = 0; k < nonkey_cnt; k++) {
                     fprintf(out, "NULL|");
                 }
                 fprintf(out, "\n");
+
+                clock_gettime(CLOCK_MONOTONIC, &tw2);
+                g_time_write += diff_sec(&tw1, &tw2);
             }
         }
 
@@ -210,6 +251,11 @@ void left_join_strategyB(const Table *left,
     fclose(lf);
     fclose(out);
 
+    clock_gettime(CLOCK_MONOTONIC, &tj_end);
+    double total_join = diff_sec(&tj_start, &tj_end);
+    g_time_join = total_join - g_time_read - g_time_write;
+    if (g_time_join < 0.0) g_time_join = 0.0;
+    
     *left_block_count_out  = left_blocks;
     *right_block_count_out = right_blocks;
 }

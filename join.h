@@ -8,5 +8,8 @@ void left_join_strategyB(const Table *left,
                          const char *output_path,
                          int *left_block_count_out,
                          int *right_block_count_out);
+extern double g_time_read;
+extern double g_time_join;
+extern double g_time_write;
 
 #endif
