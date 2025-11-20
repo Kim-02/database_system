@@ -1,14 +1,16 @@
-CC = gcc
+CC     = gcc
 CFLAGS = -g -Wall
-OBJS = main.o
 TARGET = main.out
+
+OBJS = main.o memory.o table.o blockio.o join.o
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-main.o: main.c
+%.o: %.c
+	$(CC) $(CFLAGS) -c $<
 
 clean:
 	rm -f *.o $(TARGET)
