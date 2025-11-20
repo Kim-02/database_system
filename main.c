@@ -9,8 +9,7 @@
 #define MAX_COLUMNS             64
 #define MAX_HEADER_LEN          256
 #define MAX_COL_NAME            64
-#define MAX_RECORDS_PER_BLOCK   256   /* 블록당 최대 레코드 수 (필요시 늘리면 됨) */
-#define MAX_RIGHT_BLOCKS_LIMIT  1024   /* 너무 큰 K 방지용 상한 */
+#define MIN_REC_BYTES           2
 
 static size_t g_max_memory_bytes = 0;   /* 설정된 메모리 상한 */
 static size_t g_big_alloc_bytes  = 0;   /* big_alloc으로 할당된 총량 */
@@ -218,7 +217,8 @@ static int fill_block(FILE *fp,
                       Block *blk,
                       char **rec_ptrs,
                       int *out_count,
-                      PendingLine *pend)
+                      PendingLine *pend,
+                      int max_recs)
 {
     blk->hdr.used         = sizeof(BlockHeader);
     blk->hdr.record_count = 0;
@@ -279,12 +279,13 @@ static int fill_block(FILE *fp,
             break;
         }
 
-        if (*out_count >= MAX_RECORDS_PER_BLOCK) {
-            fprintf(stderr,
-                    "[ERROR] Too many records in one block. "
-                    "Increase MAX_RECORDS_PER_BLOCK.\n");
-            exit(EXIT_FAILURE);
-        }
+            if (*out_count >= max_recs) {
+                fprintf(stderr,
+                        "[ERROR] Too many records in one block. "
+                        "max_recs=%d, block_size=%zu\n",
+                        max_recs, block_size);
+                exit(EXIT_FAILURE);
+            }
 
         char *p = (char*)blk + blk->hdr.used;
         uint16_t len16 = (uint16_t)rec_len;
@@ -333,17 +334,37 @@ static void left_join_strategyB(const Table *left,
                 g_max_memory_bytes, B_L, B_R);
         exit(EXIT_FAILURE);
     }
+    int max_left_recs  = (int)(B_L / (sizeof(uint16_t) + MIN_REC_BYTES));
+    int max_right_recs = (int)(B_R / (sizeof(uint16_t) + MIN_REC_BYTES));
+
+    if (max_left_recs <= 0 || max_right_recs <= 0) {
+        fprintf(stderr,
+                "[ERROR] block_size too small: B_L=%zu, B_R=%zu\n",
+                B_L, B_R);
+        exit(EXIT_FAILURE);
+    }
 
     /* 오른쪽 1블록당 실제로 필요한 big_alloc 메모리(데이터 + 포인터들) 추정 */
     size_t per_right_block_bytes =
         B_R
-    + sizeof(Block*)                    /* right_blks[i] 포인터 슬롯 하나 */
-    + sizeof(int)                       /* right_counts[i] 하나 */
-    + sizeof(char*) * MAX_RECORDS_PER_BLOCK; /* right_recs에서 이 블록이 차지하는 포인터들 */
+    + sizeof(Block*)                      /* right_blks[i] 포인터 슬롯 하나 */
+    + sizeof(int)                         /* right_counts[i] 하나 */
+    + sizeof(char*) * (size_t)max_right_recs; /* right_recs에서 이 블록이 차지하는 포인터들 */
 
-    /* 왼쪽 블록 한 개(B_L)를 뺀 나머지에서 오른쪽 K블록을 넣을 수 있는 최대 개수 */
-    size_t max_bytes_for_right =
-        (g_max_memory_bytes > B_L) ? (g_max_memory_bytes - B_L) : 0;
+    /* 왼쪽이 항상 차지하는 메모리(블록 + 레코드 포인터 배열) */
+    size_t left_fixed_bytes =
+        B_L + sizeof(char*) * (size_t)max_left_recs;
+
+    if (g_max_memory_bytes <= left_fixed_bytes) {
+        fprintf(stderr,
+                "[ERROR] max_mem_bytes (%zu) is too small: "
+                "need at least left block + left rec ptrs (%zu bytes)\n",
+                g_max_memory_bytes, left_fixed_bytes);
+        exit(EXIT_FAILURE);
+    }
+
+    /* 나머지에서 오른쪽 K블록에 쓸 수 있는 최대 바이트 */
+    size_t max_bytes_for_right = g_max_memory_bytes - left_fixed_bytes;
 
     int max_right_blocks = 1;
     if (g_max_memory_bytes > 0) {
@@ -360,18 +381,17 @@ static void left_join_strategyB(const Table *left,
             exit(EXIT_FAILURE);
         }
     }
-
     /* 디버깅용 출력 */
     printf("[INFO] max_mem=%zu, B_L=%zu, B_R=%zu, "
         "per_right_block=%zu, K(max_right_blocks)=%d\n",
         g_max_memory_bytes, B_L, B_R, per_right_block_bytes, max_right_blocks);
 
 
-    /* 왼쪽은 1블록 버퍼 */
-    Block *left_blk = (Block*)big_alloc(B_L);
-    char  *left_recs[MAX_RECORDS_PER_BLOCK];
+    /* 왼쪽은 1블록 버퍼 + 그 안의 레코드 포인터 배열(동적 크기) */
+    Block *left_blk  = (Block*)big_alloc(B_L);
+    char **left_recs = (char**)big_alloc(sizeof(char*) * (size_t)max_left_recs);    
 
-    /* 오른쪽은 K블록 버퍼 */
+   /* 오른쪽은 K블록 버퍼 */
     Block **right_blks = (Block**)big_alloc(sizeof(Block*) * (size_t)max_right_blocks);
     for (int i = 0; i < max_right_blocks; i++) {
         right_blks[i] = (Block*)big_alloc(B_R);
@@ -379,7 +399,7 @@ static void left_join_strategyB(const Table *left,
 
     /* 각 오른쪽 블록의 레코드 포인터 배열(2차원처럼 사용) */
     char **right_recs = (char**)big_alloc(
-        sizeof(char*) * (size_t)max_right_blocks * (size_t)MAX_RECORDS_PER_BLOCK);
+        sizeof(char*) * (size_t)max_right_blocks * (size_t)max_right_recs);
     int   *right_counts = (int*)big_alloc(sizeof(int) * (size_t)max_right_blocks);
 
     FILE *lf = fopen(left->filename, "r");
@@ -402,7 +422,8 @@ static void left_join_strategyB(const Table *left,
 
     /* 외부 루프: 왼쪽 테이블을 블록 단위로 1개씩 처리 */
     while (fill_block(lf, B_L,
-                      left_blk, left_recs, &left_count, &pendL))
+                  left_blk, left_recs, &left_count, &pendL,
+                  max_left_recs))
     {
         if (left_count == 0) {
             break;
@@ -432,13 +453,14 @@ static void left_join_strategyB(const Table *left,
             for (int bi = 0; bi < max_right_blocks; bi++) {
                 int rcnt;
                 char **rec_ptrs_for_block =
-                    &right_recs[bi * MAX_RECORDS_PER_BLOCK];
+                    &right_recs[bi * max_right_recs];
 
                 int ok = fill_block(rf, B_R,
                                     right_blks[bi],
                                     rec_ptrs_for_block,
                                     &rcnt,
-                                    &pendR);
+                                    &pendR,
+                                    max_right_recs);
                 if (!ok) {
                     break;  /* 더 이상 읽을 블록 없음 (EOF + pending 없음) */
                 }
@@ -464,7 +486,7 @@ static void left_join_strategyB(const Table *left,
                 for (int bi = 0; bi < loaded_blocks; bi++) {
                     int rcnt = right_counts[bi];
                     char **base_rec_ptrs =
-                        &right_recs[bi * MAX_RECORDS_PER_BLOCK];
+                        &right_recs[bi * max_right_recs];
 
                     for (int j = 0; j < rcnt; j++) {
                         char *recR = base_rec_ptrs[j];
