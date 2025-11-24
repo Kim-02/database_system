@@ -1,0 +1,60 @@
+[INFO] max_mem=268435456, B_L=1024, B_R=1024, per_right_block=3084, K(max_right_blocks)=87040
+========== STATS ==========
+Elapsed time : 113.616660 seconds
+  Read time  : 105.549689 seconds
+  Join time  : 7.322002 seconds
+  Write time : 0.744954 seconds
+Big alloc    : 268434432 bytes (blocks etc.)
+Max RSS      : 97024 KB (OS reported)
+Left blocks  : 751
+Right blocks : 2401698
+Memory usage : 268434432 / 268435456 bytes (100.00%)
+Output file  : join.txt
+[INFO] max_mem=268435456, B_L=1024, B_R=1024, per_right_block=3084, K(max_right_blocks)=87040
+========== STATS ==========
+Elapsed time : 100.577614 seconds
+  Read time  : 92.931188 seconds
+  Join time  : 7.041244 seconds
+  Write time : 0.605172 seconds
+Big alloc    : 268434432 bytes (blocks etc.)
+Max RSS      : 97024 KB (OS reported)
+Left blocks  : 751
+Right blocks : 2401698
+Memory usage : 268434432 / 268435456 bytes (100.00%)
+Output file  : join.txt
+[INFO] max_mem=268435456, B_L=1024, B_R=1024, per_right_block=3084, K(max_right_blocks)=87040
+========== STATS ==========
+Elapsed time : 105.013641 seconds
+  Read time  : 97.123892 seconds
+  Join time  : 7.194513 seconds
+  Write time : 0.695225 seconds
+Big alloc    : 268434432 bytes (blocks etc.)
+Max RSS      : 97024 KB (OS reported)
+Left blocks  : 751
+Right blocks : 2401698
+Memory usage : 268434432 / 268435456 bytes (100.00%)
+Output file  : join.txt
+[INFO] max_mem=268435456, B_L=1024, B_R=1024, per_right_block=3084, K(max_right_blocks)=87040
+========== STATS ==========
+Elapsed time : 96.389226 seconds
+  Read time  : 88.957037 seconds
+  Join time  : 6.891276 seconds
+  Write time : 0.540901 seconds
+Big alloc    : 268434432 bytes (blocks etc.)
+Max RSS      : 97024 KB (OS reported)
+Left blocks  : 751
+Right blocks : 2401698
+Memory usage : 268434432 / 268435456 bytes (100.00%)
+Output file  : join.txt
+[INFO] max_mem=268435456, B_L=1024, B_R=1024, per_right_block=3084, K(max_right_blocks)=87040
+========== STATS ==========
+Elapsed time : 102.996772 seconds
+  Read time  : 95.380167 seconds
+  Join time  : 6.978014 seconds
+  Write time : 0.638581 seconds
+Big alloc    : 268434432 bytes (blocks etc.)
+Max RSS      : 97024 KB (OS reported)
+Left blocks  : 751
+Right blocks : 2401698
+Memory usage : 268434432 / 268435456 bytes (100.00%)
+Output file  : join.txt
