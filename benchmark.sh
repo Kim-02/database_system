@@ -15,7 +15,7 @@ LOG_FILE="benchmark_M${MEM}_BL${BLOCK_L}_BR${BLOCK_R}_${TIMESTAMP}.log"
 
 echo "============================================" | tee $LOG_FILE
 echo "  TPC-H Join Benchmark" | tee -a $LOG_FILE
-echo "  Date: $(date)" | tee -a $LOG_FILE
+echo "  Date: $(date '+%Y-%m-%d %H:%M:%S')" | tee -a $LOG_FILE
 echo "  Memory: ${MEM}MB, Left Block: ${BLOCK_L}B, Right Block: ${BLOCK_R}B, Runs: $RUNS" | tee -a $LOG_FILE
 echo "============================================" | tee -a $LOG_FILE
 echo "" | tee -a $LOG_FILE
