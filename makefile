@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -g -Wall
+CFLAGS = -O3 -Wall -march=native -flto
 TARGET = main.out
 
 OBJS = main.o memory.o table.o blockio.o join.o
