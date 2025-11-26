@@ -194,6 +194,7 @@ void left_join_strategyB(const Table *left,
             perror("fopen join.txt");
             exit(EXIT_FAILURE);
         }
+        setvbuf(out, NULL, _IOFBF, 65536); // I/O 버퍼링 최적화 1
 
         Block *left_blk  = (Block*)big_alloc(B_L);
         char **left_recs = (char**)big_alloc(sizeof(char*) * (size_t)max_left_recs);
@@ -343,6 +344,7 @@ void left_join_strategyB(const Table *left,
             perror("fopen join.txt");
             exit(EXIT_FAILURE);
         }
+        setvbuf(out, NULL, _IOFBF, 65536); // I/O 버퍼링 최적화2
 
         PendingLine pendL = {0};
 
