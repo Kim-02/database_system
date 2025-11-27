@@ -1,96 +1,165 @@
+/* join.c (CHUNKED + RIGHT_SCAN_PER_CHUNK, no malloc/calloc/strdup in join) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-#include <sys/stat.h>   // ★ 추가
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include "memory.h"
 #include "table.h"
 #include "blockio.h"
 #include "join.h"
 
-/* ==== 조인 단계별 시간 측정용 전역 변수 ==== */
+/* ==== timing globals ==== */
 double g_time_read  = 0.0;
 double g_time_join  = 0.0;
 double g_time_write = 0.0;
 
-/* ============================================================
- * [추가] Hash Join을 위한 해시 테이블 구현
- * ============================================================ */
-#define HASH_SIZE 65537  /* 소수 사용 - 해시 충돌 최소화 */
+static void pendingline_free_local(PendingLine *p) {
+    if (!p) return;
+    if (p->pending_line) {
+        free(p->pending_line);
+        p->pending_line = NULL;
+    }
+}
 
+static double diff_sec(const struct timespec *s, const struct timespec *e) {
+    return (e->tv_sec - s->tv_sec) + (e->tv_nsec - s->tv_nsec) / 1e9;
+}
+
+/* FNV-1a 64-bit */
+static uint64_t hash_string64(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static size_t next_pow2(size_t x) {
+    if (x <= 1) return 1;
+    size_t p = 1;
+    while (p < x) p <<= 1;
+    return p;
+}
+
+/* ============================================================
+ * JoinArena: big_alloc로 한 번 잡고, chunk마다 reset만 하는 아레나
+ *   - join.c 안에서는 malloc/calloc/strdup/free 금지
+ * ============================================================ */
+typedef struct {
+    unsigned char *base;
+    size_t cap;
+    size_t used;
+} JoinArena;
+
+static void jarena_init(JoinArena *a, size_t cap_bytes) {
+    a->base = (unsigned char*)big_alloc(cap_bytes);
+    a->cap  = cap_bytes;
+    a->used = 0;
+}
+
+static void jarena_reset(JoinArena *a) {
+    a->used = 0;
+}
+
+static void* jarena_alloc(JoinArena *a, size_t bytes, size_t align) {
+    if (align < 8) align = 8;
+    size_t cur = a->used;
+    size_t aligned = (cur + (align - 1)) & ~(align - 1);
+    if (aligned + bytes > a->cap) return NULL;
+    void *p = a->base + aligned;
+    a->used = aligned + bytes;
+    return p;
+}
+
+static void* jarena_calloc(JoinArena *a, size_t n, size_t sz, size_t align) {
+    size_t bytes = n * sz;
+    void *p = jarena_alloc(a, bytes, align);
+    if (!p) return NULL;
+    memset(p, 0, bytes);
+    return p;
+}
+
+/* ============================================================
+ * Hash table for chunked join
+ *  - 노드는 (hash, left_record_ptr, matched_flag_ptr)만 저장 (문자열 복제 X)
+ * ============================================================ */
 typedef struct HashNode {
-    char *key;
-    char *record;
-    char *nonkey_fields;
+    uint64_t h;
+    char    *left_rec;
+    uint8_t *matched_flag;
     struct HashNode *next;
 } HashNode;
 
 typedef struct {
-    HashNode *buckets[HASH_SIZE];
+    size_t bucket_count;   /* power of 2 */
+    HashNode **buckets;
 } HashTable;
 
-/* 해시 함수 (djb2 알고리즘) */
-static unsigned int hash_func(const char *str) {
-    unsigned int h = 5381;
-    while (*str) {
-        h = ((h << 5) + h) + (unsigned char)*str++;
-    }
-    return h % HASH_SIZE;
+static int ht_init(HashTable *ht, JoinArena *a, size_t bucket_count) {
+    ht->bucket_count = bucket_count;
+    ht->buckets = (HashNode**)jarena_calloc(a, bucket_count, sizeof(HashNode*), sizeof(void*));
+    return ht->buckets != NULL;
 }
 
-/* 해시 테이블에 삽입 */
-static void hash_insert(HashTable *ht, const char *key,
-                        const char *record, const char *nonkey) {
-    unsigned int idx = hash_func(key);
-    HashNode *node = (HashNode*)malloc(sizeof(HashNode));
-    if (!node) {
-        perror("malloc HashNode");
-        exit(EXIT_FAILURE);
-    }
-    node->key = strdup(key);
-    node->record = strdup(record);
-    node->nonkey_fields = strdup(nonkey);
-    node->next = ht->buckets[idx];
-    ht->buckets[idx] = node;
+static int ht_insert(HashTable *ht, JoinArena *a, uint64_t h, char *left_rec, uint8_t *matched_flag) {
+    size_t idx = (size_t)(h & (ht->bucket_count - 1));
+    HashNode *n = (HashNode*)jarena_alloc(a, sizeof(HashNode), sizeof(void*));
+    if (!n) return 0;
+    n->h = h;
+    n->left_rec = left_rec;
+    n->matched_flag = matched_flag;
+    n->next = ht->buckets[idx];
+    ht->buckets[idx] = n;
+    return 1;
 }
 
-/* 해시 테이블에서 검색 - 해당 버킷의 첫 노드 반환 */
-static HashNode* hash_find(HashTable *ht, const char *key) {
-    unsigned int idx = hash_func(key);
-    return ht->buckets[idx];
+/* I/O 버퍼도 big_alloc로 잡아서 setvbuf에 전달(= 제한에 포함) */
+typedef struct {
+    size_t out_buf_sz;
+    size_t in_buf_sz;
+    size_t total_bytes;
+} IoBufPlan;
+
+static IoBufPlan plan_iobuf(size_t max_mem) {
+    IoBufPlan p = {0};
+
+    if (max_mem == 0) {
+        p.out_buf_sz = 1 << 20;   /* 1MB */
+        p.in_buf_sz  = 1 << 20;   /* 1MB */
+        p.total_bytes = p.out_buf_sz + 2 * p.in_buf_sz;
+        return p;
+    }
+
+    /* 전체 예산의 1/32, 최소 64KB, 최대 4MB */
+    size_t budget = max_mem / 32;
+    if (budget < 64 * 1024) budget = 64 * 1024;
+    if (budget > (4ULL << 20)) budget = (4ULL << 20);
+
+    /* out 1/2, input(좌/우) 1/4씩 */
+    p.out_buf_sz = budget / 2;
+    p.in_buf_sz  = budget / 4;
+    if (p.out_buf_sz < 64 * 1024) p.out_buf_sz = 64 * 1024;
+    if (p.in_buf_sz  < 64 * 1024) p.in_buf_sz  = 64 * 1024;
+
+    p.total_bytes = p.out_buf_sz + 2 * p.in_buf_sz;
+    return p;
 }
 
-/* 해시 테이블 메모리 해제 */
-static void hash_free(HashTable *ht) {
-    for (int i = 0; i < HASH_SIZE; i++) {
-        HashNode *n = ht->buckets[i];
-        while (n) {
-            HashNode *tmp = n;
-            n = n->next;
-            free(tmp->key);
-            free(tmp->record);
-            free(tmp->nonkey_fields);
-            free(tmp);
-        }
-        ht->buckets[i] = NULL;
-    }
+/* ceil_div */
+static size_t ceil_div_sz(size_t a, size_t b) {
+    return (b == 0) ? 0 : (a + b - 1) / b;
 }
+
 /* ============================================================
- * [추가 끝] Hash Join 해시 테이블 구현
+ * StrategyB:
+ *   - (2) LEFT_CHUNKED + RIGHT_SCAN_PER_CHUNK (네가 원하는 구조)
+ *   - (log) expected_passes / pass별 right blocks / 총 pass 요약
  * ============================================================ */
-
-static double diff_sec(const struct timespec *start,
-                       const struct timespec *end)
-{
-    return (end->tv_sec  - start->tv_sec)
-         + (end->tv_nsec - start->tv_nsec) / 1e9;
-}
-
-/* B-전략: 
- *  - 오른쪽 전체가 메모리에 들어가면: 오른쪽 전체를 한 번만 읽어서 메모리에 올리고 재사용
- *  - 안 들어가면: 왼쪽을 chunk로 묶어서 메모리에 올리고, chunk마다 오른쪽을 한 번씩 스캔
- */
 void left_join_strategyB(const Table *left,
                          const Table *right,
                          const char *output_path,
@@ -103,621 +172,321 @@ void left_join_strategyB(const Table *left,
     struct timespec tj_start, tj_end;
     clock_gettime(CLOCK_MONOTONIC, &tj_start);
 
-    /* ---- 기본 유효성 검사 ---- */
-    if (g_max_memory_bytes > 0 && g_max_memory_bytes < B_L + B_R) {
-        fprintf(stderr,
-                "[ERROR] max_mem_bytes (%zu) is too small: "
-                "need at least left_block(%zu) + right_block(%zu)\n",
-                g_max_memory_bytes, B_L, B_R);
+    /* ---- basic checks ---- */
+    if (B_L < sizeof(BlockHeader) + sizeof(uint16_t) + MIN_REC_BYTES ||
+        B_R < sizeof(BlockHeader) + sizeof(uint16_t) + MIN_REC_BYTES) {
+        fprintf(stderr, "[ERROR] block_size too small: B_L=%zu, B_R=%zu\n", B_L, B_R);
         exit(EXIT_FAILURE);
     }
 
     int max_left_recs  = (int)(B_L / (sizeof(uint16_t) + MIN_REC_BYTES));
     int max_right_recs = (int)(B_R / (sizeof(uint16_t) + MIN_REC_BYTES));
-
     if (max_left_recs <= 0 || max_right_recs <= 0) {
-        fprintf(stderr,
-                "[ERROR] block_size too small: B_L=%zu, B_R=%zu\n",
-                B_L, B_R);
+        fprintf(stderr, "[ERROR] invalid max recs: L=%d R=%d\n", max_left_recs, max_right_recs);
         exit(EXIT_FAILURE);
     }
 
-    /* 블록 1개당 필요한 메모리 추정 */
-    size_t per_right_block_bytes =
-        B_R
-      + sizeof(Block*)
-      + sizeof(int)
-      + sizeof(char*) * (size_t)max_right_recs;
-
-    size_t per_left_block_bytes =
-        B_L + sizeof(char*) * (size_t)max_left_recs;
-
-    if (g_max_memory_bytes > 0 &&
-        g_max_memory_bytes <= per_left_block_bytes) {
-        fprintf(stderr,
-                "[ERROR] max_mem_bytes (%zu) is too small: "
-                "need at least one left block + left rec ptrs (%zu bytes)\n",
-                g_max_memory_bytes, per_left_block_bytes);
-        exit(EXIT_FAILURE);
-    }
-
-    /* 오른쪽 파일 크기 / 블록 수 추정 */
-    struct stat stR;
+    /* ---- file size estimation (for logs) ---- */
+    struct stat stL, stR;
+    size_t left_file_size = 0;
     size_t right_file_size = 0;
+    size_t left_blocks_est = 0;
     size_t right_blocks_est = 0;
 
+    if (stat(left->filename, &stL) == 0) {
+        left_file_size = (size_t)stL.st_size;
+        left_blocks_est = (left_file_size + B_L - 1) / B_L;
+        if (left_blocks_est == 0) left_blocks_est = 1;
+    }
     if (stat(right->filename, &stR) == 0) {
         right_file_size = (size_t)stR.st_size;
         right_blocks_est = (right_file_size + B_R - 1) / B_R;
         if (right_blocks_est == 0) right_blocks_est = 1;
-    } else {
-        perror("stat right");
-        fprintf(stderr, "[WARN] stat failed for %s, will estimate with runtime blocks.\n",
-                right->filename);
-        right_blocks_est = 0; // 나중에 runtime 기준으로만 판단
     }
 
-    /* 오른쪽 전체를 메모리에 올릴 수 있는지 판단 */
-    int right_fits_in_mem = 0;
-    size_t max_right_blocks_by_mem = 0;
+    /* ---- allocate fixed buffers (all via big_alloc) ---- */
+    Block *blkR = (Block*)big_alloc(B_R);
+    char **recsR = (char**)big_alloc(sizeof(char*) * (size_t)max_right_recs);
 
+    IoBufPlan io = plan_iobuf(g_max_memory_bytes);
+    char *out_buf = (char*)big_alloc(io.out_buf_sz);
+    char *inL_buf = (char*)big_alloc(io.in_buf_sz);
+    char *inR_buf = (char*)big_alloc(io.in_buf_sz);
+
+    /* ---- decide chunk budget vs hash budget (strict within max_mem) ---- */
+    size_t safety = 64 * 1024;
+
+    if (g_max_memory_bytes > 0 && g_big_alloc_bytes + safety > g_max_memory_bytes) {
+        fprintf(stderr, "[ERROR] max_mem too small (fixed alloc already near limit)\n");
+        exit(EXIT_FAILURE);
+    }
+
+    /* 해시 아레나 예산: max_mem의 1/8, 최소 256KB, 최대 max_mem/2 */
+    size_t hash_budget = 0;
     if (g_max_memory_bytes == 0) {
-        /* 메모리 제한 없음: 이론상 다 올릴 수 있다고 가정 */
-        right_fits_in_mem = 1;
-        max_right_blocks_by_mem = (right_blocks_est > 0) ? right_blocks_est : 0;
+        hash_budget = 64ULL << 20; /* 64MB default when unlimited */
     } else {
-        size_t max_bytes_for_right = g_max_memory_bytes - per_left_block_bytes;
-        if (per_right_block_bytes == 0) {
-            fprintf(stderr, "[ERROR] per_right_block_bytes == 0 ?\n");
-            exit(EXIT_FAILURE);
-        }
-        max_right_blocks_by_mem = max_bytes_for_right / per_right_block_bytes;
-        if (right_blocks_est > 0 &&
-            max_right_blocks_by_mem >= right_blocks_est) {
-            right_fits_in_mem = 1;
-        }
+        hash_budget = g_max_memory_bytes / 8;
+        if (hash_budget < 256 * 1024) hash_budget = 256 * 1024;
+        if (hash_budget > g_max_memory_bytes / 2) hash_budget = g_max_memory_bytes / 2;
     }
 
-    printf("[INFO] max_mem=%zu, B_L=%zu, B_R=%zu\n",
-           g_max_memory_bytes, B_L, B_R);
-    printf("[INFO] max_left_recs=%d, max_right_recs=%d\n",
-           max_left_recs, max_right_recs);
-    printf("[INFO] right_file_size=%zu, est_right_blocks=%zu, "
-           "per_right_block=%zu, max_right_blocks_by_mem=%zu, "
-           "right_fits_in_mem=%d\n",
-           right_file_size, right_blocks_est,
-           per_right_block_bytes, max_right_blocks_by_mem,
-           right_fits_in_mem);
+    /* 오른쪽 1블록은 항상 있어야 함 */
+    size_t per_right_block_bytes =
+        B_R + sizeof(char*) * (size_t)max_right_recs;
 
-    int left_blocks  = 0;
-    int right_blocks = 0;
+    size_t per_left_block_bytes_full =
+        B_L + sizeof(char*) * (size_t)max_left_recs + sizeof(Block*) + sizeof(int);
 
-    /* ==== 케이스 1: 오른쪽 전체를 메모리에 올릴 수 있는 경우 ==== */
-    if (right_fits_in_mem) {
-        printf("[INFO] Strategy: FULL_RIGHT_IN_MEMORY\n");
-
-        /* ---- 오른쪽 전체를 메모리에 로드 ---- */
-        size_t capacity_blocks = (right_blocks_est > 0)
-                               ? right_blocks_est
-                               : (max_right_blocks_by_mem > 0 ? max_right_blocks_by_mem : 1024);
-
-        Block **right_blks = (Block**)big_alloc(sizeof(Block*) * capacity_blocks);
-        for (size_t i = 0; i < capacity_blocks; i++) {
-            right_blks[i] = (Block*)big_alloc(B_R);
+    size_t max_left_blocks_chunk = 1;
+    if (g_max_memory_bytes > 0) {
+        size_t used_now = g_big_alloc_bytes;
+        if (used_now + safety + hash_budget >= g_max_memory_bytes) {
+            /* 해시 예산이 너무 커서 chunk가 0이 되는 상황 방지 */
+            hash_budget = (g_max_memory_bytes > used_now + safety + 64*1024)
+                        ? (g_max_memory_bytes - used_now - safety - 64*1024)
+                        : 64*1024;
         }
-        char **right_recs = (char**)big_alloc(
-            sizeof(char*) * capacity_blocks * (size_t)max_right_recs);
-        int   *right_counts = (int*)big_alloc(sizeof(int) * capacity_blocks);
 
-        FILE *rf = fopen(right->filename, "r");
-        if (!rf) {
-            perror("fopen right");
+        size_t remain = g_max_memory_bytes - g_big_alloc_bytes - safety;
+        /* remain 안에서: hash_budget + (right 1blk) + (left chunk) */
+        if (remain <= hash_budget + per_right_block_bytes + per_left_block_bytes_full) {
+            max_left_blocks_chunk = 1;
+        } else {
+            size_t left_budget = remain - hash_budget - per_right_block_bytes;
+            max_left_blocks_chunk = left_budget / per_left_block_bytes_full;
+            if (max_left_blocks_chunk < 1) max_left_blocks_chunk = 1;
+        }
+    } else {
+        max_left_blocks_chunk = 65536; /* arbitrary cap when unlimited */
+    }
+
+    /* expected passes log (left_blocks_est / chunk_max_blocks) */
+    size_t expected_passes = 0;
+    if (left_blocks_est > 0) {
+        expected_passes = ceil_div_sz(left_blocks_est, max_left_blocks_chunk);
+        if (expected_passes == 0) expected_passes = 1;
+    }
+
+    /* chunk arrays */
+    Block **left_blks = (Block**)big_alloc(sizeof(Block*) * max_left_blocks_chunk);
+    for (size_t i = 0; i < max_left_blocks_chunk; i++) {
+        left_blks[i] = (Block*)big_alloc(B_L);
+    }
+    char **left_recs = (char**)big_alloc(sizeof(char*) * max_left_blocks_chunk * (size_t)max_left_recs);
+    int  *left_counts = (int*)big_alloc(sizeof(int) * max_left_blocks_chunk);
+
+    /* right scan buffers (1 block) */
+    Block *right_blk = blkR;
+    char **right_recs = recsR;
+
+    /* hash arena */
+    JoinArena arena;
+    jarena_init(&arena, hash_budget);
+
+    printf("[INFO] Strategy: LEFT_CHUNKED + RIGHT_SCAN_PER_CHUNK (strict join allocations)\n");
+    printf("[INFO] max_mem=%zu, B_L=%zu, B_R=%zu\n", g_max_memory_bytes, B_L, B_R);
+    printf("[INFO] max_left_recs=%d, max_right_recs=%d\n", max_left_recs, max_right_recs);
+    printf("[INFO] left_file_size=%zu, right_file_size=%zu\n", left_file_size, right_file_size);
+    printf("[INFO] est_left_blocks=%zu, est_right_blocks=%zu\n", left_blocks_est, right_blocks_est);
+    printf("[INFO] chunk_max_blocks=%zu, hash_budget=%zu, fixed_big_alloc=%zu\n",
+           max_left_blocks_chunk, hash_budget, g_big_alloc_bytes);
+    printf("[INFO] expected_passes=%zu (ceil(est_left_blocks/chunk_max_blocks))\n", expected_passes);
+
+    int left_blocks_total = 0;
+    int right_blocks_total = 0;
+
+    /* pass counters (LOG 핵심) */
+    size_t chunk_passes = 0;
+    size_t right_scan_passes = 0;
+
+    FILE *lf = fopen(left->filename, "r");
+    if (!lf) { perror("fopen left"); exit(EXIT_FAILURE); }
+    setvbuf(lf, inL_buf, _IOFBF, io.in_buf_sz);
+
+    FILE *out = fopen(output_path, "w");
+    if (!out) { perror("fopen output"); exit(EXIT_FAILURE); }
+    setvbuf(out, out_buf, _IOFBF, io.out_buf_sz);
+
+    PendingLine pendL = {0};
+    const int nonkey_cnt = right->header.num_columns - 1;
+
+    while (1) {
+        chunk_passes++;
+        size_t right_blocks_this_pass = 0;
+
+        /* ---- load one left chunk ---- */
+        int chunk_blocks = 0;
+
+        for (size_t bi = 0; bi < max_left_blocks_chunk; bi++) {
+            int lc = 0;
+            char **rec_ptrs_for_block = &left_recs[bi * (size_t)max_left_recs];
+
+            struct timespec tr1, tr2;
+            clock_gettime(CLOCK_MONOTONIC, &tr1);
+            int ok = fill_block(lf, B_L, left_blks[bi], rec_ptrs_for_block, &lc, &pendL, max_left_recs);
+            clock_gettime(CLOCK_MONOTONIC, &tr2);
+            g_time_read += diff_sec(&tr1, &tr2);
+
+            if (!ok || lc == 0) break;
+
+            left_counts[bi] = lc;
+            chunk_blocks++;
+            left_blocks_total++;
+        }
+
+        if (chunk_blocks == 0) {
+            chunk_passes--; /* 마지막 빈 패스는 제외 */
+            break;
+        }
+
+        /* ---- build flat matched bitmap for this chunk (in arena) ---- */
+        int total_left_recs = 0;
+        for (int bi = 0; bi < chunk_blocks; bi++) total_left_recs += left_counts[bi];
+
+        jarena_reset(&arena);
+
+        uint8_t *matched = (uint8_t*)jarena_calloc(&arena, (size_t)total_left_recs, sizeof(uint8_t), 8);
+        if (!matched) {
+            fprintf(stderr, "[ERROR] hash arena too small for matched bitmap (%d recs)\n", total_left_recs);
             exit(EXIT_FAILURE);
         }
+
+        /* ---- init hash table ---- */
+        size_t bucket_count = next_pow2((size_t)total_left_recs * 2);
+        if (bucket_count < 1024) bucket_count = 1024;
+
+        /* buckets too big? shrink */
+        while (bucket_count * sizeof(HashNode*) > arena.cap / 3 && bucket_count > 1024) {
+            bucket_count >>= 1;
+        }
+
+        HashTable ht;
+        if (!ht_init(&ht, &arena, bucket_count)) {
+            fprintf(stderr, "[ERROR] hash arena too small for buckets (%zu)\n", bucket_count);
+            exit(EXIT_FAILURE);
+        }
+
+        /* ---- insert all left records into hash table ---- */
+        int rid = 0;
+        for (int bi = 0; bi < chunk_blocks; bi++) {
+            char **blk_recs = &left_recs[(size_t)bi * (size_t)max_left_recs];
+            for (int i = 0; i < left_counts[bi]; i++) {
+                char keyL[256];
+                get_field(blk_recs[i], left->header.key_index, keyL, sizeof(keyL));
+                uint64_t h = hash_string64(keyL);
+
+                if (!ht_insert(&ht, &arena, h, blk_recs[i], &matched[rid])) {
+                    fprintf(stderr, "[ERROR] hash arena overflow while inserting left records\n");
+                    exit(EXIT_FAILURE);
+                }
+                rid++;
+            }
+        }
+
+        /* ---- scan right once for this chunk ---- */
+        FILE *rf = fopen(right->filename, "r");
+        if (!rf) { perror("fopen right"); exit(EXIT_FAILURE); }
+        setvbuf(rf, inR_buf, _IOFBF, io.in_buf_sz);
+
+        right_scan_passes++;
+
         PendingLine pendR = {0};
 
-        size_t used_blocks = 0;
-        while (used_blocks < capacity_blocks) {
-            int rcnt;
-            char **rec_ptrs_for_block =
-                &right_recs[used_blocks * (size_t)max_right_recs];
+        while (1) {
+            int rc = 0;
 
             struct timespec tr1, tr2;
             clock_gettime(CLOCK_MONOTONIC, &tr1);
-            int ok = fill_block(rf, B_R,
-                                right_blks[used_blocks],
-                                rec_ptrs_for_block,
-                                &rcnt,
-                                &pendR,
-                                max_right_recs);
+            int ok = fill_block(rf, B_R, right_blk, right_recs, &rc, &pendR, max_right_recs);
             clock_gettime(CLOCK_MONOTONIC, &tr2);
             g_time_read += diff_sec(&tr1, &tr2);
 
-            if (!ok || rcnt == 0) {
-                break;
+            if (!ok || rc == 0) break;
+
+            right_blocks_total++;
+            right_blocks_this_pass++;
+
+            for (int j = 0; j < rc; j++) {
+                char keyR[256];
+                get_field(right_recs[j], right->header.key_index, keyR, sizeof(keyR));
+                uint64_t h = hash_string64(keyR);
+                size_t b = (size_t)(h & (ht.bucket_count - 1));
+
+                /* probe chain */
+                for (HashNode *n = ht.buckets[b]; n; n = n->next) {
+                    if (n->h != h) continue;
+
+                    /* collision check */
+                    char keyL2[256];
+                    get_field(n->left_rec, left->header.key_index, keyL2, sizeof(keyL2));
+                    if (strcmp(keyL2, keyR) != 0) continue;
+
+                    char right_nonkey[4096];
+                    build_nonkey_fields(right, right_recs[j], right_nonkey, sizeof(right_nonkey));
+
+                    struct timespec tw1, tw2;
+                    clock_gettime(CLOCK_MONOTONIC, &tw1);
+                    fputs(n->left_rec, out);
+                    fputs(right_nonkey, out);
+                    fputc('\n', out);
+                    clock_gettime(CLOCK_MONOTONIC, &tw2);
+                    g_time_write += diff_sec(&tw1, &tw2);
+
+                    *(n->matched_flag) = 1;
+                }
             }
-
-            right_counts[used_blocks] = rcnt;
-            used_blocks++;
-            right_blocks++;
         }
 
-        if (pendR.pending_line) {
-            free(pendR.pending_line);
-        }
+        /* PendingLine이 내부에서 malloc을 쓴다면 누수 방지 */
+        pendingline_free_local(&pendR);
         fclose(rf);
 
-        printf("[INFO] Loaded right blocks into memory: %zu blocks\n", used_blocks);
-
-        /* ============================================================
-         * [추가] Hash Join - 오른쪽 테이블로 해시 테이블 구축
-         * ============================================================ */
-        HashTable *ht = (HashTable*)calloc(1, sizeof(HashTable));
-        if (!ht) {
-            perror("calloc HashTable");
-            exit(EXIT_FAILURE);
+        /* pass 로그(너무 많이 찍히는 것 방지: 앞 5회 + 10회마다) */
+        if (chunk_passes <= 5 || (chunk_passes % 10 == 0)) {
+            printf("[INFO] pass=%zu/%zu (expected~%zu), chunk_blocks=%d, left_recs=%d, right_blocks_this_pass=%zu\n",
+                   chunk_passes,
+                   (expected_passes ? expected_passes : 0),
+                   expected_passes,
+                   chunk_blocks,
+                   total_left_recs,
+                   right_blocks_this_pass);
         }
 
-        for (size_t bi = 0; bi < used_blocks; bi++) {
-            int rcnt = right_counts[bi];
-            char **rec_ptrs = &right_recs[bi * (size_t)max_right_recs];
-            for (int j = 0; j < rcnt; j++) {
-                char keyR[256], nonkey[4096];
-                get_field(rec_ptrs[j], right->header.key_index, keyR, sizeof(keyR));
-                build_nonkey_fields(right, rec_ptrs[j], nonkey, sizeof(nonkey));
-                hash_insert(ht, keyR, rec_ptrs[j], nonkey);
-            }
-        }
-        printf("[INFO] Hash table built for right table\n");
-        /* ============================================================
-         * [추가 끝] Hash Join - 해시 테이블 구축 완료
-         * ============================================================ */
-
-        /* ---- 왼쪽을 블록 단위로 읽으면서, 메모리상의 오른쪽과 조인 ---- */
-        FILE *lf = fopen(left->filename, "r");
-        if (!lf) {
-            perror("fopen left");
-            exit(EXIT_FAILURE);
-        }
-        FILE *out = fopen(output_path, "w");
-        if (!out) {
-            perror("fopen join.txt");
-            exit(EXIT_FAILURE);
-        }
-
-        Block *left_blk  = (Block*)big_alloc(B_L);
-        char **left_recs = (char**)big_alloc(sizeof(char*) * (size_t)max_left_recs);
-
-        PendingLine pendL = {0};
-
-        while (1) {
-            struct timespec tr1, tr2;
-            clock_gettime(CLOCK_MONOTONIC, &tr1);
-            int left_count;
-            int ok_left = fill_block(lf, B_L,
-                                     left_blk, left_recs, &left_count, &pendL,
-                                     max_left_recs);
-            clock_gettime(CLOCK_MONOTONIC, &tr2);
-            g_time_read += diff_sec(&tr1, &tr2);
-
-            if (!ok_left || left_count == 0) {
-                break;
-            }
-            left_blocks++;
-
-            int *matched = (int*)calloc((size_t)left_count, sizeof(int));
-            if (!matched) {
-                perror("calloc matched");
-                exit(EXIT_FAILURE);
-            }
-
-            /* ============================================================
-             * [변경] Hash Join으로 교체 - 기존 Nested Loop 주석 처리
-             * ============================================================ */
-            
-            /* [기존 코드 - Nested Loop Join]
-            for (int i = 0; i < left_count; i++) {
-                char keyL[256];
-                get_field(left_recs[i], left->header.key_index,
-                          keyL, sizeof(keyL));
-
-                for (size_t bi = 0; bi < used_blocks; bi++) {
-                    int rcnt = right_counts[bi];
-                    char **base_rec_ptrs =
-                        &right_recs[bi * (size_t)max_right_recs];
-
-                    for (int j = 0; j < rcnt; j++) {
-                        char *recR = base_rec_ptrs[j];
-                        char keyR[256];
-                        get_field(recR, right->header.key_index,
-                                  keyR, sizeof(keyR));
-
-                        if (strcmp(keyL, keyR) == 0) {
-                            char right_nonkey[4096];
-                            build_nonkey_fields(right,
-                                                recR,
-                                                right_nonkey,
-                                                sizeof(right_nonkey));
-
-                            struct timespec tw1, tw2;
-                            clock_gettime(CLOCK_MONOTONIC, &tw1);
-                            fprintf(out, "%s%s\n", left_recs[i], right_nonkey);
-                            clock_gettime(CLOCK_MONOTONIC, &tw2);
-                            g_time_write += diff_sec(&tw1, &tw2);
-
-                            matched[i] = 1;
-                        }
-                    }
-                }
-            }
-            [기존 코드 끝] */
-
-            /* [새 코드 - Hash Join] */
-            for (int i = 0; i < left_count; i++) {
-                char keyL[256];
-                get_field(left_recs[i], left->header.key_index,
-                          keyL, sizeof(keyL));
-
-                /* 해시 테이블에서 조회 - O(1) */
-                HashNode *node = hash_find(ht, keyL);
-                while (node) {
-                    if (strcmp(node->key, keyL) == 0) {
-                        struct timespec tw1, tw2;
-                        clock_gettime(CLOCK_MONOTONIC, &tw1);
-                        fprintf(out, "%s%s\n", left_recs[i], node->nonkey_fields);
-                        clock_gettime(CLOCK_MONOTONIC, &tw2);
-                        g_time_write += diff_sec(&tw1, &tw2);
-
-                        matched[i] = 1;
-                    }
-                    node = node->next;
-                }
-            }
-            /* [새 코드 끝] */
-            /* ============================================================
-             * [변경 끝] Hash Join
-             * ============================================================ */
-
-            /* 매칭 안 된 왼쪽 레코드에 대해 NULL 채워서 출력 */
-            int nonkey_cnt = right->header.num_columns - 1;
-            for (int i = 0; i < left_count; i++) {
-                if (!matched[i]) {
+        /* ---- emit unmatched left records with NULLs ---- */
+        rid = 0;
+        for (int bi = 0; bi < chunk_blocks; bi++) {
+            char **blk_recs = &left_recs[(size_t)bi * (size_t)max_left_recs];
+            for (int i = 0; i < left_counts[bi]; i++) {
+                if (matched[rid] == 0) {
                     struct timespec tw1, tw2;
                     clock_gettime(CLOCK_MONOTONIC, &tw1);
 
-                    fprintf(out, "%s", left_recs[i]);
-                    for (int k = 0; k < nonkey_cnt; k++) {
-                        fprintf(out, "NULL|");
-                    }
-                    fprintf(out, "\n");
+                    fputs(blk_recs[i], out);
+                    for (int k = 0; k < nonkey_cnt; k++) fputs("NULL|", out);
+                    fputc('\n', out);
 
                     clock_gettime(CLOCK_MONOTONIC, &tw2);
                     g_time_write += diff_sec(&tw1, &tw2);
                 }
+                rid++;
             }
-
-            free(matched);
         }
-
-        if (pendL.pending_line) {
-            free(pendL.pending_line);
-        }
-
-        /* ============================================================
-         * [추가] Hash Join - 해시 테이블 메모리 해제
-         * ============================================================ */
-        hash_free(ht);
-        free(ht);
-        /* ============================================================
-         * [추가 끝] Hash Join - 해시 테이블 메모리 해제
-         * ============================================================ */
-
-        fclose(lf);
-        fclose(out);
-    }
-    /* ==== 케이스 2: 오른쪽 전체가 메모리에 안 들어가는 경우 ==== */
-    else {
-        printf("[INFO] Strategy: LEFT_CHUNKED + RIGHT_SCAN_PER_CHUNK\n");
-
-        /* 오른쪽 1블록(또는 소량)만 메모리에 두고,
-           남은 메모리로 왼쪽 블록 여러 개를 chunk로 올림 */
-        size_t mem_for_right = per_right_block_bytes;
-        size_t mem_for_left_chunks = g_max_memory_bytes - mem_for_right;
-
-        /* 왼쪽 1블록에 실제로 big_alloc 할 모든 것 포함:
-        - 데이터 블록(B_L)
-        - left_recs 내 포인터(char* * max_left_recs)
-        - left_blks 포인터 배열에 대한 Block* 하나
-        - left_counts 배열에 대한 int 하나
-        */
-        size_t bytes_per_left_block_full =
-            per_left_block_bytes      // B_L + char* * max_left_recs
-        + sizeof(Block*)            // left_blks[bi]
-        + sizeof(int);              // left_counts[bi]
-
-        if (mem_for_left_chunks < bytes_per_left_block_full) {
-            fprintf(stderr,
-                    "[ERROR] max_mem_bytes(%zu) too small for chunked join. "
-                    "Need at least one full left block (%zu bytes)\n",
-                    g_max_memory_bytes, bytes_per_left_block_full);
-            exit(EXIT_FAILURE);
-        }
-
-        int max_left_blocks_chunk =
-            (int)(mem_for_left_chunks / bytes_per_left_block_full);
-        if (max_left_blocks_chunk < 1) max_left_blocks_chunk = 1;
-
-        printf("[INFO] max_left_blocks_per_chunk=%d (bytes_per_left_block_full=%zu)\n",
-            max_left_blocks_chunk, bytes_per_left_block_full);
-
-        /* 왼쪽 chunk용 버퍼 */
-        Block **left_blks = (Block**)big_alloc(sizeof(Block*) * (size_t)max_left_blocks_chunk);
-        for (int i = 0; i < max_left_blocks_chunk; i++) {
-            left_blks[i] = (Block*)big_alloc(B_L);
-        }
-        char **left_recs = (char**)big_alloc(
-            sizeof(char*) * (size_t)max_left_blocks_chunk * (size_t)max_left_recs);
-        int   *left_counts = (int*)big_alloc(sizeof(int) * (size_t)max_left_blocks_chunk);
-
-        /* 오른쪽 1블록용 버퍼 */
-        Block *right_blk = (Block*)big_alloc(B_R);
-        char **right_recs = (char**)big_alloc(sizeof(char*) * (size_t)max_right_recs);
-
-        FILE *lf = fopen(left->filename, "r");
-        if (!lf) {
-            perror("fopen left");
-            exit(EXIT_FAILURE);
-        }
-        FILE *out = fopen(output_path, "w");
-        if (!out) {
-            perror("fopen join.txt");
-            exit(EXIT_FAILURE);
-        }
-
-        PendingLine pendL = {0};
-
-        while (1) {
-            /* ---- 왼쪽에서 하나의 chunk(여러 블록)를 메모리에 채움 ---- */
-            int chunk_blocks = 0;
-
-            for (int bi = 0; bi < max_left_blocks_chunk; bi++) {
-                int left_count;
-                char **rec_ptrs_for_block =
-                    &left_recs[bi * (size_t)max_left_recs];
-
-                struct timespec tr1, tr2;
-                clock_gettime(CLOCK_MONOTONIC, &tr1);
-                int ok_left = fill_block(lf, B_L,
-                                         left_blks[bi],
-                                         rec_ptrs_for_block,
-                                         &left_count,
-                                         &pendL,
-                                         max_left_recs);
-                clock_gettime(CLOCK_MONOTONIC, &tr2);
-                g_time_read += diff_sec(&tr1, &tr2);
-
-                if (!ok_left || left_count == 0) {
-                    break;
-                }
-
-                left_counts[bi] = left_count;
-                chunk_blocks++;
-                left_blocks++;
-            }
-
-            if (chunk_blocks == 0) {
-                /* 더 이상 읽을 왼쪽 블록 없음 */
-                break;
-            }
-
-            /* chunk 내 각 왼쪽 블록/레코드별 matched 플래그 */
-            int **matched = (int**)malloc(sizeof(int*) * (size_t)chunk_blocks);
-            if (!matched) {
-                perror("malloc matched[]");
-                exit(EXIT_FAILURE);
-            }
-            for (int bi = 0; bi < chunk_blocks; bi++) {
-                matched[bi] = (int*)calloc((size_t)left_counts[bi], sizeof(int));
-                if (!matched[bi]) {
-                    perror("calloc matched[bi]");
-                    exit(EXIT_FAILURE);
-                }
-            }
-
-            /* ============================================================
-             * [추가] Hash Join - 왼쪽 chunk로 해시 테이블 구축
-             * ============================================================ */
-            HashTable *ht_chunk = (HashTable*)calloc(1, sizeof(HashTable));
-            if (!ht_chunk) {
-                perror("calloc HashTable chunk");
-                exit(EXIT_FAILURE);
-            }
-
-            /* 왼쪽 chunk의 모든 레코드를 해시 테이블에 삽입 */
-            /* 각 노드에 (bi, i) 인덱스를 저장하기 위해 record 필드에 인코딩 */
-            for (int bi = 0; bi < chunk_blocks; bi++) {
-                int left_count = left_counts[bi];
-                char **left_block_recs = &left_recs[bi * (size_t)max_left_recs];
-                for (int i = 0; i < left_count; i++) {
-                    char keyL[256];
-                    get_field(left_block_recs[i], left->header.key_index,
-                              keyL, sizeof(keyL));
-                    
-                    /* record 필드에 "bi:i" 형태로 인덱스 저장 */
-                    char idx_str[64];
-                    snprintf(idx_str, sizeof(idx_str), "%d:%d", bi, i);
-                    hash_insert(ht_chunk, keyL, idx_str, left_block_recs[i]);
-                }
-            }
-            /* ============================================================
-             * [추가 끝] Hash Join - 왼쪽 chunk 해시 테이블 구축 완료
-             * ============================================================ */
-
-            /* ---- 이 chunk에 대해, 오른쪽 파일을 한 번 스캔 ---- */
-            FILE *rf = fopen(right->filename, "r");
-            if (!rf) {
-                perror("fopen right");
-                exit(EXIT_FAILURE);
-            }
-            PendingLine pendR = {0};
-
-            while (1) {
-                int rcnt;
-
-                struct timespec tr1, tr2;
-                clock_gettime(CLOCK_MONOTONIC, &tr1);
-                int ok_right = fill_block(rf, B_R,
-                                          right_blk,
-                                          right_recs,
-                                          &rcnt,
-                                          &pendR,
-                                          max_right_recs);
-                clock_gettime(CLOCK_MONOTONIC, &tr2);
-                g_time_read += diff_sec(&tr1, &tr2);
-
-                if (!ok_right || rcnt == 0) {
-                    break;
-                }
-
-                right_blocks++;
-
-                /* ============================================================
-                 * [변경] Hash Join으로 교체 - 기존 Nested Loop 주석 처리
-                 * ============================================================ */
-
-                /* [기존 코드 - Nested Loop Join]
-                for (int bi = 0; bi < chunk_blocks; bi++) {
-                    int left_count = left_counts[bi];
-                    char **left_block_recs =
-                        &left_recs[bi * (size_t)max_left_recs];
-
-                    for (int i = 0; i < left_count; i++) {
-                        char keyL[256];
-                        get_field(left_block_recs[i], left->header.key_index,
-                                  keyL, sizeof(keyL));
-
-                        for (int j = 0; j < rcnt; j++) {
-                            char *recR = right_recs[j];
-                            char keyR[256];
-                            get_field(recR, right->header.key_index,
-                                      keyR, sizeof(keyR));
-
-                            if (strcmp(keyL, keyR) == 0) {
-                                char right_nonkey[4096];
-                                build_nonkey_fields(right,
-                                                    recR,
-                                                    right_nonkey,
-                                                    sizeof(right_nonkey));
-
-                                struct timespec tw1, tw2;
-                                clock_gettime(CLOCK_MONOTONIC, &tw1);
-                                fprintf(out, "%s%s\n", left_block_recs[i], right_nonkey);
-                                clock_gettime(CLOCK_MONOTONIC, &tw2);
-                                g_time_write += diff_sec(&tw1, &tw2);
-
-                                matched[bi][i] = 1;
-                            }
-                        }
-                    }
-                }
-                [기존 코드 끝] */
-
-                /* [새 코드 - Hash Join] */
-                /* 오른쪽 블록의 각 레코드를 해시 조회 */
-                for (int j = 0; j < rcnt; j++) {
-                    char *recR = right_recs[j];
-                    char keyR[256];
-                    get_field(recR, right->header.key_index,
-                              keyR, sizeof(keyR));
-
-                    /* 해시 테이블에서 매칭되는 왼쪽 레코드 조회 */
-                    HashNode *node = hash_find(ht_chunk, keyR);
-                    while (node) {
-                        if (strcmp(node->key, keyR) == 0) {
-                            /* record 필드에서 bi:i 인덱스 추출 */
-                            int bi, idx;
-                            sscanf(node->record, "%d:%d", &bi, &idx);
-
-                            char right_nonkey[4096];
-                            build_nonkey_fields(right, recR,
-                                                right_nonkey, sizeof(right_nonkey));
-
-                            struct timespec tw1, tw2;
-                            clock_gettime(CLOCK_MONOTONIC, &tw1);
-                            /* nonkey_fields에 왼쪽 레코드 저장해둠 */
-                            fprintf(out, "%s%s\n", node->nonkey_fields, right_nonkey);
-                            clock_gettime(CLOCK_MONOTONIC, &tw2);
-                            g_time_write += diff_sec(&tw1, &tw2);
-
-                            matched[bi][idx] = 1;
-                        }
-                        node = node->next;
-                    }
-                }
-                /* [새 코드 끝] */
-                /* ============================================================
-                 * [변경 끝] Hash Join
-                 * ============================================================ */
-            }
-
-            if (pendR.pending_line) {
-                free(pendR.pending_line);
-            }
-            fclose(rf);
-
-            /* ============================================================
-             * [추가] Hash Join - chunk 해시 테이블 메모리 해제
-             * ============================================================ */
-            hash_free(ht_chunk);
-            free(ht_chunk);
-            /* ============================================================
-             * [추가 끝] Hash Join - chunk 해시 테이블 메모리 해제
-             * ============================================================ */
-
-            /* ---- 매칭 안 된 왼쪽 레코드들 NULL 채워서 출력 ---- */
-            int nonkey_cnt = right->header.num_columns - 1;
-            for (int bi = 0; bi < chunk_blocks; bi++) {
-                int left_count = left_counts[bi];
-                char **left_block_recs =
-                    &left_recs[bi * (size_t)max_left_recs];
-
-                for (int i = 0; i < left_count; i++) {
-                    if (!matched[bi][i]) {
-                        struct timespec tw1, tw2;
-                        clock_gettime(CLOCK_MONOTONIC, &tw1);
-
-                        fprintf(out, "%s", left_block_recs[i]);
-                        for (int k = 0; k < nonkey_cnt; k++) {
-                            fprintf(out, "NULL|");
-                        }
-                        fprintf(out, "\n");
-
-                        clock_gettime(CLOCK_MONOTONIC, &tw2);
-                        g_time_write += diff_sec(&tw1, &tw2);
-                    }
-                }
-            }
-
-            for (int bi = 0; bi < chunk_blocks; bi++) {
-                free(matched[bi]);
-            }
-            free(matched);
-        }
-
-        if (pendL.pending_line) {
-            free(pendL.pending_line);
-        }
-
-        fclose(lf);
-        fclose(out);
     }
 
-    /* ==== 공통: join time 계산 및 블록 카운트 반환 ==== */
+    pendingline_free_local(&pendL);
+    fclose(lf);
+    fclose(out);
+
+    /* 최종 요약 로그 */
+    printf("[INFO] SUMMARY: chunk_passes=%zu, right_scan_passes=%zu, total_left_blocks=%d, total_right_blocks=%d\n",
+           chunk_passes, right_scan_passes, left_blocks_total, right_blocks_total);
+
     clock_gettime(CLOCK_MONOTONIC, &tj_end);
-    double total_join = diff_sec(&tj_start, &tj_end);
-    g_time_join = total_join - g_time_read - g_time_write;
+    double total = diff_sec(&tj_start, &tj_end);
+    g_time_join = total - g_time_read - g_time_write;
     if (g_time_join < 0.0) g_time_join = 0.0;
 
-    *left_block_count_out  = left_blocks;
-    *right_block_count_out = right_blocks;
+    *left_block_count_out  = left_blocks_total;
+    *right_block_count_out = right_blocks_total;
 }
