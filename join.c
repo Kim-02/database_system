@@ -14,72 +14,6 @@ double g_time_read  = 0.0;
 double g_time_join  = 0.0;
 double g_time_write = 0.0;
 
-/* ============================================================
- * [추가] Hash Join을 위한 해시 테이블 구현
- * ============================================================ */
-#define HASH_SIZE 65537  /* 소수 사용 - 해시 충돌 최소화 */
-
-typedef struct HashNode {
-    char *key;
-    char *record;
-    char *nonkey_fields;
-    struct HashNode *next;
-} HashNode;
-
-typedef struct {
-    HashNode *buckets[HASH_SIZE];
-} HashTable;
-
-/* 해시 함수 (djb2 알고리즘) */
-static unsigned int hash_func(const char *str) {
-    unsigned int h = 5381;
-    while (*str) {
-        h = ((h << 5) + h) + (unsigned char)*str++;
-    }
-    return h % HASH_SIZE;
-}
-
-/* 해시 테이블에 삽입 */
-static void hash_insert(HashTable *ht, const char *key,
-                        const char *record, const char *nonkey) {
-    unsigned int idx = hash_func(key);
-    HashNode *node = (HashNode*)malloc(sizeof(HashNode));
-    if (!node) {
-        perror("malloc HashNode");
-        exit(EXIT_FAILURE);
-    }
-    node->key = strdup(key);
-    node->record = strdup(record);
-    node->nonkey_fields = strdup(nonkey);
-    node->next = ht->buckets[idx];
-    ht->buckets[idx] = node;
-}
-
-/* 해시 테이블에서 검색 - 해당 버킷의 첫 노드 반환 */
-static HashNode* hash_find(HashTable *ht, const char *key) {
-    unsigned int idx = hash_func(key);
-    return ht->buckets[idx];
-}
-
-/* 해시 테이블 메모리 해제 */
-static void hash_free(HashTable *ht) {
-    for (int i = 0; i < HASH_SIZE; i++) {
-        HashNode *n = ht->buckets[i];
-        while (n) {
-            HashNode *tmp = n;
-            n = n->next;
-            free(tmp->key);
-            free(tmp->record);
-            free(tmp->nonkey_fields);
-            free(tmp);
-        }
-        ht->buckets[i] = NULL;
-    }
-}
-/* ============================================================
- * [추가 끝] Hash Join 해시 테이블 구현
- * ============================================================ */
-
 static double diff_sec(const struct timespec *start,
                        const struct timespec *end)
 {
@@ -249,30 +183,6 @@ void left_join_strategyB(const Table *left,
 
         printf("[INFO] Loaded right blocks into memory: %zu blocks\n", used_blocks);
 
-        /* ============================================================
-         * [추가] Hash Join - 오른쪽 테이블로 해시 테이블 구축
-         * ============================================================ */
-        HashTable *ht = (HashTable*)calloc(1, sizeof(HashTable));
-        if (!ht) {
-            perror("calloc HashTable");
-            exit(EXIT_FAILURE);
-        }
-
-        for (size_t bi = 0; bi < used_blocks; bi++) {
-            int rcnt = right_counts[bi];
-            char **rec_ptrs = &right_recs[bi * (size_t)max_right_recs];
-            for (int j = 0; j < rcnt; j++) {
-                char keyR[256], nonkey[4096];
-                get_field(rec_ptrs[j], right->header.key_index, keyR, sizeof(keyR));
-                build_nonkey_fields(right, rec_ptrs[j], nonkey, sizeof(nonkey));
-                hash_insert(ht, keyR, rec_ptrs[j], nonkey);
-            }
-        }
-        printf("[INFO] Hash table built for right table\n");
-        /* ============================================================
-         * [추가 끝] Hash Join - 해시 테이블 구축 완료
-         * ============================================================ */
-
         /* ---- 왼쪽을 블록 단위로 읽으면서, 메모리상의 오른쪽과 조인 ---- */
         FILE *lf = fopen(left->filename, "r");
         if (!lf) {
@@ -311,11 +221,7 @@ void left_join_strategyB(const Table *left,
                 exit(EXIT_FAILURE);
             }
 
-            /* ============================================================
-             * [변경] Hash Join으로 교체 - 기존 Nested Loop 주석 처리
-             * ============================================================ */
-            
-            /* [기존 코드 - Nested Loop Join]
+            /* 조인: 오른쪽은 메모리에 있는 블록들만 순회 */
             for (int i = 0; i < left_count; i++) {
                 char keyL[256];
                 get_field(left_recs[i], left->header.key_index,
@@ -350,33 +256,6 @@ void left_join_strategyB(const Table *left,
                     }
                 }
             }
-            [기존 코드 끝] */
-
-            /* [새 코드 - Hash Join] */
-            for (int i = 0; i < left_count; i++) {
-                char keyL[256];
-                get_field(left_recs[i], left->header.key_index,
-                          keyL, sizeof(keyL));
-
-                /* 해시 테이블에서 조회 - O(1) */
-                HashNode *node = hash_find(ht, keyL);
-                while (node) {
-                    if (strcmp(node->key, keyL) == 0) {
-                        struct timespec tw1, tw2;
-                        clock_gettime(CLOCK_MONOTONIC, &tw1);
-                        fprintf(out, "%s%s\n", left_recs[i], node->nonkey_fields);
-                        clock_gettime(CLOCK_MONOTONIC, &tw2);
-                        g_time_write += diff_sec(&tw1, &tw2);
-
-                        matched[i] = 1;
-                    }
-                    node = node->next;
-                }
-            }
-            /* [새 코드 끝] */
-            /* ============================================================
-             * [변경 끝] Hash Join
-             * ============================================================ */
 
             /* 매칭 안 된 왼쪽 레코드에 대해 NULL 채워서 출력 */
             int nonkey_cnt = right->header.num_columns - 1;
@@ -402,15 +281,6 @@ void left_join_strategyB(const Table *left,
         if (pendL.pending_line) {
             free(pendL.pending_line);
         }
-
-        /* ============================================================
-         * [추가] Hash Join - 해시 테이블 메모리 해제
-         * ============================================================ */
-        hash_free(ht);
-        free(ht);
-        /* ============================================================
-         * [추가 끝] Hash Join - 해시 테이블 메모리 해제
-         * ============================================================ */
 
         fclose(lf);
         fclose(out);
@@ -524,35 +394,6 @@ void left_join_strategyB(const Table *left,
                 }
             }
 
-            /* ============================================================
-             * [추가] Hash Join - 왼쪽 chunk로 해시 테이블 구축
-             * ============================================================ */
-            HashTable *ht_chunk = (HashTable*)calloc(1, sizeof(HashTable));
-            if (!ht_chunk) {
-                perror("calloc HashTable chunk");
-                exit(EXIT_FAILURE);
-            }
-
-            /* 왼쪽 chunk의 모든 레코드를 해시 테이블에 삽입 */
-            /* 각 노드에 (bi, i) 인덱스를 저장하기 위해 record 필드에 인코딩 */
-            for (int bi = 0; bi < chunk_blocks; bi++) {
-                int left_count = left_counts[bi];
-                char **left_block_recs = &left_recs[bi * (size_t)max_left_recs];
-                for (int i = 0; i < left_count; i++) {
-                    char keyL[256];
-                    get_field(left_block_recs[i], left->header.key_index,
-                              keyL, sizeof(keyL));
-                    
-                    /* record 필드에 "bi:i" 형태로 인덱스 저장 */
-                    char idx_str[64];
-                    snprintf(idx_str, sizeof(idx_str), "%d:%d", bi, i);
-                    hash_insert(ht_chunk, keyL, idx_str, left_block_recs[i]);
-                }
-            }
-            /* ============================================================
-             * [추가 끝] Hash Join - 왼쪽 chunk 해시 테이블 구축 완료
-             * ============================================================ */
-
             /* ---- 이 chunk에 대해, 오른쪽 파일을 한 번 스캔 ---- */
             FILE *rf = fopen(right->filename, "r");
             if (!rf) {
@@ -581,11 +422,7 @@ void left_join_strategyB(const Table *left,
 
                 right_blocks++;
 
-                /* ============================================================
-                 * [변경] Hash Join으로 교체 - 기존 Nested Loop 주석 처리
-                 * ============================================================ */
-
-                /* [기존 코드 - Nested Loop Join]
+                /* 오른쪽 블록의 각 레코드를, chunk 내 모든 왼쪽 레코드와 비교 */
                 for (int bi = 0; bi < chunk_blocks; bi++) {
                     int left_count = left_counts[bi];
                     char **left_block_recs =
@@ -620,59 +457,12 @@ void left_join_strategyB(const Table *left,
                         }
                     }
                 }
-                [기존 코드 끝] */
-
-                /* [새 코드 - Hash Join] */
-                /* 오른쪽 블록의 각 레코드를 해시 조회 */
-                for (int j = 0; j < rcnt; j++) {
-                    char *recR = right_recs[j];
-                    char keyR[256];
-                    get_field(recR, right->header.key_index,
-                              keyR, sizeof(keyR));
-
-                    /* 해시 테이블에서 매칭되는 왼쪽 레코드 조회 */
-                    HashNode *node = hash_find(ht_chunk, keyR);
-                    while (node) {
-                        if (strcmp(node->key, keyR) == 0) {
-                            /* record 필드에서 bi:i 인덱스 추출 */
-                            int bi, idx;
-                            sscanf(node->record, "%d:%d", &bi, &idx);
-
-                            char right_nonkey[4096];
-                            build_nonkey_fields(right, recR,
-                                                right_nonkey, sizeof(right_nonkey));
-
-                            struct timespec tw1, tw2;
-                            clock_gettime(CLOCK_MONOTONIC, &tw1);
-                            /* nonkey_fields에 왼쪽 레코드 저장해둠 */
-                            fprintf(out, "%s%s\n", node->nonkey_fields, right_nonkey);
-                            clock_gettime(CLOCK_MONOTONIC, &tw2);
-                            g_time_write += diff_sec(&tw1, &tw2);
-
-                            matched[bi][idx] = 1;
-                        }
-                        node = node->next;
-                    }
-                }
-                /* [새 코드 끝] */
-                /* ============================================================
-                 * [변경 끝] Hash Join
-                 * ============================================================ */
             }
 
             if (pendR.pending_line) {
                 free(pendR.pending_line);
             }
             fclose(rf);
-
-            /* ============================================================
-             * [추가] Hash Join - chunk 해시 테이블 메모리 해제
-             * ============================================================ */
-            hash_free(ht_chunk);
-            free(ht_chunk);
-            /* ============================================================
-             * [추가 끝] Hash Join - chunk 해시 테이블 메모리 해제
-             * ============================================================ */
 
             /* ---- 매칭 안 된 왼쪽 레코드들 NULL 채워서 출력 ---- */
             int nonkey_cnt = right->header.num_columns - 1;
