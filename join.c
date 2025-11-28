@@ -1,4 +1,17 @@
-/* join.c (CHUNKED + RIGHT_SCAN_PER_CHUNK, no malloc/calloc/strdup in join) */
+/* join.c (CHUNKED MERGE JOIN + RIGHT_RES CAN_PER_CHUNK, strict big_alloc, log-friendly)
+ *
+ * Goal:
+ *  - Memory 변화 / Block size 변화가 성능에 확실히 드러나게:
+ *      => left를 "chunk" 단위로 메모리에 올리고, chunk마다 right를 처음부터 재스캔하는 방식
+ *         (chunk가 작을수록 pass 수 증가 -> right 재스캔 증가 -> Read time 급증)
+ *  - 메모리/블록 사용 형태는 기존 스타일 유지 (big_alloc 기반, block 기반 fill_block)
+ *  - 로그 형식은 기존 형태 유지 (expected_passes / pass별 right_blocks / SUMMARY)
+ *
+ * Assumption:
+ *  - left/right 입력은 join key 기준으로 "정렬(비내림차순)"되어 있음.
+ *  - fill_block/get_field/build_nonkey_fields/Block/PendingLine 등은 기존 프로젝트 구현 사용.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,39 +30,55 @@ double g_time_read  = 0.0;
 double g_time_join  = 0.0;
 double g_time_write = 0.0;
 
-static void pendingline_free_local(PendingLine *p) {
-    if (!p) return;
-    if (p->pending_line) {
-        free(p->pending_line);
-        p->pending_line = NULL;
-    }
-}
-
 static double diff_sec(const struct timespec *s, const struct timespec *e) {
     return (e->tv_sec - s->tv_sec) + (e->tv_nsec - s->tv_nsec) / 1e9;
 }
 
-/* FNV-1a 64-bit */
-static uint64_t hash_string64(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
-    while (*s) {
-        h ^= (unsigned char)*s++;
-        h *= 1099511628211ULL;
+/* PendingLine 내부 구현이 프로젝트마다 다를 수 있어서:
+ *  - 여기서는 멤버에 직접 접근/해제하지 않음(컴파일 에러 회피).
+ *  - fill_block 내부에서 동적할당을 한다면 누수가 될 수 있지만,
+ *    이 join.c는 "메모리/블록 성능 실험" 목적의 strict big_alloc 흐름을 우선.
+ */
+static void pendingline_free_local(PendingLine *p) {
+    (void)p;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Small helpers: key comparison (numeric if both numeric, else strcmp)       */
+/* ------------------------------------------------------------------------- */
+static int is_all_digits(const char *s) {
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return 0;
     }
-    return h;
+    return 1;
 }
 
-static size_t next_pow2(size_t x) {
-    if (x <= 1) return 1;
-    size_t p = 1;
-    while (p < x) p <<= 1;
-    return p;
+static int key_compare(const char *a, const char *b) {
+    if (a == NULL && b == NULL) return 0;
+    if (a == NULL) return -1;
+    if (b == NULL) return  1;
+
+    if (is_all_digits(a) && is_all_digits(b)) {
+        unsigned long long va = strtoull(a, NULL, 10);
+        unsigned long long vb = strtoull(b, NULL, 10);
+        if (va < vb) return -1;
+        if (va > vb) return  1;
+        return 0;
+    }
+    return strcmp(a, b);
 }
 
-/* ============================================================
- * JoinArena: big_alloc로 한 번 잡고, chunk마다 reset만 하는 아레나
- *   - join.c 안에서는 malloc/calloc/strdup/free 금지
- * ============================================================ */
+/* ceil_div */
+static size_t ceil_div_sz(size_t a, size_t b) {
+    return (b == 0) ? 0 : (a + b - 1) / b;
+}
+
+/* ------------------------------------------------------------------------- */
+/* JoinArena: big_alloc로 한 번 잡고, 그룹 단위로 reset해서 재사용             */
+/* ------------------------------------------------------------------------- */
 typedef struct {
     unsigned char *base;
     size_t cap;
@@ -76,61 +105,29 @@ static void* jarena_alloc(JoinArena *a, size_t bytes, size_t align) {
     return p;
 }
 
-static void* jarena_calloc(JoinArena *a, size_t n, size_t sz, size_t align) {
-    size_t bytes = n * sz;
-    void *p = jarena_alloc(a, bytes, align);
+static char* jarena_strdup_s(JoinArena *a, const char *s) {
+    size_t n = strlen(s);
+    char *p = (char*)jarena_alloc(a, n + 1, 1);
     if (!p) return NULL;
-    memset(p, 0, bytes);
+    memcpy(p, s, n + 1);
     return p;
 }
 
-/* ============================================================
- * Hash table for chunked join
- *  - 노드는 (hash, left_record_ptr, matched_flag_ptr)만 저장 (문자열 복제 X)
- * ============================================================ */
-typedef struct HashNode {
-    uint64_t h;
-    char    *left_rec;
-    uint8_t *matched_flag;
-    struct HashNode *next;
-} HashNode;
-
-typedef struct {
-    size_t bucket_count;   /* power of 2 */
-    HashNode **buckets;
-} HashTable;
-
-static int ht_init(HashTable *ht, JoinArena *a, size_t bucket_count) {
-    ht->bucket_count = bucket_count;
-    ht->buckets = (HashNode**)jarena_calloc(a, bucket_count, sizeof(HashNode*), sizeof(void*));
-    return ht->buckets != NULL;
-}
-
-static int ht_insert(HashTable *ht, JoinArena *a, uint64_t h, char *left_rec, uint8_t *matched_flag) {
-    size_t idx = (size_t)(h & (ht->bucket_count - 1));
-    HashNode *n = (HashNode*)jarena_alloc(a, sizeof(HashNode), sizeof(void*));
-    if (!n) return 0;
-    n->h = h;
-    n->left_rec = left_rec;
-    n->matched_flag = matched_flag;
-    n->next = ht->buckets[idx];
-    ht->buckets[idx] = n;
-    return 1;
-}
-
-/* I/O 버퍼도 big_alloc로 잡아서 setvbuf에 전달(= 제한에 포함) */
+/* ------------------------------------------------------------------------- */
+/* I/O buffer plan (big_alloc 포함, max_mem에 따라 변화)                      */
+/* ------------------------------------------------------------------------- */
 typedef struct {
     size_t out_buf_sz;
     size_t in_buf_sz;
-    size_t total_bytes;
+    size_t total_bytes; /* out + inL + inR */
 } IoBufPlan;
 
 static IoBufPlan plan_iobuf(size_t max_mem) {
     IoBufPlan p = {0};
 
     if (max_mem == 0) {
-        p.out_buf_sz = 1 << 20;   /* 1MB */
-        p.in_buf_sz  = 1 << 20;   /* 1MB */
+        p.out_buf_sz  = 1 << 20; /* 1MB */
+        p.in_buf_sz   = 1 << 20; /* 1MB */
         p.total_bytes = p.out_buf_sz + 2 * p.in_buf_sz;
         return p;
     }
@@ -150,16 +147,109 @@ static IoBufPlan plan_iobuf(size_t max_mem) {
     return p;
 }
 
-/* ceil_div */
-static size_t ceil_div_sz(size_t a, size_t b) {
-    return (b == 0) ? 0 : (a + b - 1) / b;
+/* ------------------------------------------------------------------------- */
+/* Right iterator (block-based)                                               */
+/* ------------------------------------------------------------------------- */
+typedef struct {
+    FILE        *f;
+    size_t       B;
+    Block       *blk;
+    char       **recs;
+    int          max_recs;
+
+    PendingLine  pend;
+    int          cnt;
+    int          idx;
+    int          eof;
+
+    size_t       blocks_read;
+} RightIter;
+
+static void ri_init(RightIter *it, FILE *f, size_t B, Block *blk, char **recs, int max_recs) {
+    it->f = f;
+    it->B = B;
+    it->blk = blk;
+    it->recs = recs;
+    it->max_recs = max_recs;
+
+    memset(&it->pend, 0, sizeof(it->pend));
+    it->cnt = 0;
+    it->idx = 0;
+    it->eof = 0;
+    it->blocks_read = 0;
 }
 
-/* ============================================================
- * StrategyB:
- *   - (2) LEFT_CHUNKED + RIGHT_SCAN_PER_CHUNK (네가 원하는 구조)
- *   - (log) expected_passes / pass별 right blocks / 총 pass 요약
- * ============================================================ */
+static int ri_ensure(RightIter *it) {
+    if (it->eof) return 0;
+    if (it->idx < it->cnt) return 1;
+
+    /* need next block */
+    int rc = 0;
+    struct timespec tr1, tr2;
+    clock_gettime(CLOCK_MONOTONIC, &tr1);
+    int ok = fill_block(it->f, it->B, it->blk, it->recs, &rc, &it->pend, it->max_recs);
+    clock_gettime(CLOCK_MONOTONIC, &tr2);
+    g_time_read += diff_sec(&tr1, &tr2);
+
+    if (!ok || rc == 0) {
+        it->eof = 1;
+        return 0;
+    }
+
+    it->cnt = rc;
+    it->idx = 0;
+    it->blocks_read++;
+    return 1;
+}
+
+static char* ri_peek_rec(RightIter *it) {
+    if (!ri_ensure(it)) return NULL;
+    return it->recs[it->idx];
+}
+
+static int ri_peek_key(const Table *right, RightIter *it, char *out, size_t cap) {
+    char *r = ri_peek_rec(it);
+    if (!r) return 0;
+    get_field(r, right->header.key_index, out, cap);
+    return 1;
+}
+
+static void ri_advance(RightIter *it) {
+    if (!it->eof) it->idx++;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Left cursor over chunk blocks                                               */
+/* ------------------------------------------------------------------------- */
+typedef struct {
+    int bi;
+    int ri;
+} LeftCur;
+
+static int lc_has(const LeftCur *c, int chunk_blocks, const int *left_counts) {
+    if (c->bi >= chunk_blocks) return 0;
+    if (c->bi < 0) return 0;
+    if (c->ri < left_counts[c->bi]) return 1;
+
+    /* move to next block */
+    return 0;
+}
+
+static char* lc_get_rec(const LeftCur *c, char **left_recs, int max_left_recs) {
+    return left_recs[(size_t)c->bi * (size_t)max_left_recs + (size_t)c->ri];
+}
+
+static void lc_advance(LeftCur *c, int chunk_blocks, const int *left_counts) {
+    c->ri++;
+    while (c->bi < chunk_blocks && c->ri >= left_counts[c->bi]) {
+        c->bi++;
+        c->ri = 0;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* StrategyB: CHUNKED MERGE JOIN with RIGHT RESCAN PER CHUNK                   */
+/* ------------------------------------------------------------------------- */
 void left_join_strategyB(const Table *left,
                          const Table *right,
                          const char *output_path,
@@ -188,10 +278,8 @@ void left_join_strategyB(const Table *left,
 
     /* ---- file size estimation (for logs) ---- */
     struct stat stL, stR;
-    size_t left_file_size = 0;
-    size_t right_file_size = 0;
-    size_t left_blocks_est = 0;
-    size_t right_blocks_est = 0;
+    size_t left_file_size = 0, right_file_size = 0;
+    size_t left_blocks_est = 0, right_blocks_est = 0;
 
     if (stat(left->filename, &stL) == 0) {
         left_file_size = (size_t)stL.st_size;
@@ -213,62 +301,69 @@ void left_join_strategyB(const Table *left,
     char *inL_buf = (char*)big_alloc(io.in_buf_sz);
     char *inR_buf = (char*)big_alloc(io.in_buf_sz);
 
-    /* ---- decide chunk budget vs hash budget (strict within max_mem) ---- */
-    size_t safety = 64 * 1024;
+    /* spill file IO buffer (strict, to avoid libc hidden malloc effects in experiments) */
+    size_t spill_iobuf_sz = 64 * 1024;
+    if (g_max_memory_bytes > 0 && spill_iobuf_sz > g_max_memory_bytes / 16) {
+        spill_iobuf_sz = 16 * 1024;
+        if (spill_iobuf_sz < 4 * 1024) spill_iobuf_sz = 4 * 1024;
+    }
+    char *spill_iobuf = (char*)big_alloc(spill_iobuf_sz);
 
+    /* ---- memory budgeting ---- */
+    size_t safety = 64 * 1024;
     if (g_max_memory_bytes > 0 && g_big_alloc_bytes + safety > g_max_memory_bytes) {
         fprintf(stderr, "[ERROR] max_mem too small (fixed alloc already near limit)\n");
         exit(EXIT_FAILURE);
     }
 
-    /* 해시 아레나 예산: max_mem의 1/8, 최소 256KB, 최대 max_mem/2 */
-    size_t hash_budget = 0;
+    /* right group arena budget (keep small but present) */
+    size_t group_budget = 0;
     if (g_max_memory_bytes == 0) {
-        hash_budget = 64ULL << 20; /* 64MB default when unlimited */
+        group_budget = 4ULL << 20; /* 4MB */
     } else {
-        hash_budget = g_max_memory_bytes / 8;
-        if (hash_budget < 256 * 1024) hash_budget = 256 * 1024;
-        if (hash_budget > g_max_memory_bytes / 2) hash_budget = g_max_memory_bytes / 2;
+        group_budget = g_max_memory_bytes / 64; /* 1.56% */
+        if (group_budget < 128 * 1024) group_budget = 128 * 1024;
+        if (group_budget > (4ULL << 20)) group_budget = (4ULL << 20);
+
+        /* if too tight, shrink */
+        if (g_big_alloc_bytes + safety + group_budget >= g_max_memory_bytes) {
+            size_t allow = (g_max_memory_bytes > g_big_alloc_bytes + safety + 32*1024)
+                         ? (g_max_memory_bytes - g_big_alloc_bytes - safety - 32*1024)
+                         : (32*1024);
+            if (allow < 32*1024) allow = 32*1024;
+            group_budget = allow;
+        }
     }
 
-    /* 오른쪽 1블록은 항상 있어야 함 */
-    size_t per_right_block_bytes =
-        B_R + sizeof(char*) * (size_t)max_right_recs;
+    JoinArena garena;
+    jarena_init(&garena, group_budget);
 
+    /* chunk size 결정: 남는 메모리 대부분을 left chunk blocks + pointer arrays에 배정 */
     size_t per_left_block_bytes_full =
-        B_L + sizeof(char*) * (size_t)max_left_recs + sizeof(Block*) + sizeof(int);
+        B_L
+        + sizeof(char*) * (size_t)max_left_recs     /* rec pointer slots */
+        + sizeof(Block*)                           /* left_blks[] entry */
+        + sizeof(int);                             /* left_counts[] entry */
 
     size_t max_left_blocks_chunk = 1;
     if (g_max_memory_bytes > 0) {
-        size_t used_now = g_big_alloc_bytes;
-        if (used_now + safety + hash_budget >= g_max_memory_bytes) {
-            /* 해시 예산이 너무 커서 chunk가 0이 되는 상황 방지 */
-            hash_budget = (g_max_memory_bytes > used_now + safety + 64*1024)
-                        ? (g_max_memory_bytes - used_now - safety - 64*1024)
-                        : 64*1024;
-        }
-
         size_t remain = g_max_memory_bytes - g_big_alloc_bytes - safety;
-        /* remain 안에서: hash_budget + (right 1blk) + (left chunk) */
-        if (remain <= hash_budget + per_right_block_bytes + per_left_block_bytes_full) {
+        if (remain <= per_left_block_bytes_full) {
             max_left_blocks_chunk = 1;
         } else {
-            size_t left_budget = remain - hash_budget - per_right_block_bytes;
-            max_left_blocks_chunk = left_budget / per_left_block_bytes_full;
+            max_left_blocks_chunk = remain / per_left_block_bytes_full;
             if (max_left_blocks_chunk < 1) max_left_blocks_chunk = 1;
         }
     } else {
-        max_left_blocks_chunk = 65536; /* arbitrary cap when unlimited */
+        max_left_blocks_chunk = 65536;
     }
 
-    /* expected passes log (left_blocks_est / chunk_max_blocks) */
-    size_t expected_passes = 0;
-    if (left_blocks_est > 0) {
-        expected_passes = ceil_div_sz(left_blocks_est, max_left_blocks_chunk);
-        if (expected_passes == 0) expected_passes = 1;
-    }
+    size_t expected_passes = (left_blocks_est > 0)
+                           ? ceil_div_sz(left_blocks_est, max_left_blocks_chunk)
+                           : 0;
+    if (expected_passes == 0) expected_passes = 1;
 
-    /* chunk arrays */
+    /* ---- chunk arrays (big_alloc) ---- */
     Block **left_blks = (Block**)big_alloc(sizeof(Block*) * max_left_blocks_chunk);
     for (size_t i = 0; i < max_left_blocks_chunk; i++) {
         left_blks[i] = (Block*)big_alloc(B_L);
@@ -276,29 +371,26 @@ void left_join_strategyB(const Table *left,
     char **left_recs = (char**)big_alloc(sizeof(char*) * max_left_blocks_chunk * (size_t)max_left_recs);
     int  *left_counts = (int*)big_alloc(sizeof(int) * max_left_blocks_chunk);
 
-    /* right scan buffers (1 block) */
-    Block *right_blk = blkR;
-    char **right_recs = recsR;
-
-    /* hash arena */
-    JoinArena arena;
-    jarena_init(&arena, hash_budget);
-
-    printf("[INFO] Strategy: LEFT_CHUNKED + RIGHT_SCAN_PER_CHUNK (strict join allocations)\n");
+    printf("[INFO] Strategy: CHUNKED_MERGE_JOIN + RIGHT_RESCAN_PER_CHUNK (strict join allocations)\n");
     printf("[INFO] max_mem=%zu, B_L=%zu, B_R=%zu\n", g_max_memory_bytes, B_L, B_R);
     printf("[INFO] max_left_recs=%d, max_right_recs=%d\n", max_left_recs, max_right_recs);
     printf("[INFO] left_file_size=%zu, right_file_size=%zu\n", left_file_size, right_file_size);
     printf("[INFO] est_left_blocks=%zu, est_right_blocks=%zu\n", left_blocks_est, right_blocks_est);
-    printf("[INFO] chunk_max_blocks=%zu, hash_budget=%zu, fixed_big_alloc=%zu\n",
-           max_left_blocks_chunk, hash_budget, g_big_alloc_bytes);
+    printf("[INFO] chunk_max_blocks=%zu, group_budget=%zu, fixed_big_alloc=%zu\n",
+           max_left_blocks_chunk, group_budget, g_big_alloc_bytes);
     printf("[INFO] expected_passes=%zu (ceil(est_left_blocks/chunk_max_blocks))\n", expected_passes);
 
     int left_blocks_total = 0;
     int right_blocks_total = 0;
 
-    /* pass counters (LOG 핵심) */
     size_t chunk_passes = 0;
     size_t right_scan_passes = 0;
+
+    /* merge stats */
+    size_t groups = 0;
+    size_t max_right_group = 0;
+    size_t left_null_rows = 0;
+    size_t right_skips = 0;
 
     FILE *lf = fopen(left->filename, "r");
     if (!lf) { perror("fopen left"); exit(EXIT_FAILURE); }
@@ -311,13 +403,13 @@ void left_join_strategyB(const Table *left,
     PendingLine pendL = {0};
     const int nonkey_cnt = right->header.num_columns - 1;
 
+    /* ---------------- passes ---------------- */
     while (1) {
         chunk_passes++;
         size_t right_blocks_this_pass = 0;
 
         /* ---- load one left chunk ---- */
         int chunk_blocks = 0;
-
         for (size_t bi = 0; bi < max_left_blocks_chunk; bi++) {
             int lc = 0;
             char **rec_ptrs_for_block = &left_recs[bi * (size_t)max_left_recs];
@@ -336,141 +428,259 @@ void left_join_strategyB(const Table *left,
         }
 
         if (chunk_blocks == 0) {
-            chunk_passes--; /* 마지막 빈 패스는 제외 */
+            chunk_passes--; /* 마지막 빈 패스 제외 */
             break;
         }
 
-        /* ---- build flat matched bitmap for this chunk (in arena) ---- */
+        /* ---- chunk record count / min_key / max_key ---- */
         int total_left_recs = 0;
         for (int bi = 0; bi < chunk_blocks; bi++) total_left_recs += left_counts[bi];
 
-        jarena_reset(&arena);
+        char min_key[256], max_key[256];
+        min_key[0] = 0; max_key[0] = 0;
 
-        uint8_t *matched = (uint8_t*)jarena_calloc(&arena, (size_t)total_left_recs, sizeof(uint8_t), 8);
-        if (!matched) {
-            fprintf(stderr, "[ERROR] hash arena too small for matched bitmap (%d recs)\n", total_left_recs);
-            exit(EXIT_FAILURE);
+        /* first record */
+        {
+            char *r0 = left_recs[0];
+            get_field(r0, left->header.key_index, min_key, sizeof(min_key));
+        }
+        /* last record: last non-empty block */
+        {
+            int lbi = chunk_blocks - 1;
+            int lri = left_counts[lbi] - 1;
+            char *rl = left_recs[(size_t)lbi * (size_t)max_left_recs + (size_t)lri];
+            get_field(rl, left->header.key_index, max_key, sizeof(max_key));
         }
 
-        /* ---- init hash table ---- */
-        size_t bucket_count = next_pow2((size_t)total_left_recs * 2);
-        if (bucket_count < 1024) bucket_count = 1024;
-
-        /* buckets too big? shrink */
-        while (bucket_count * sizeof(HashNode*) > arena.cap / 3 && bucket_count > 1024) {
-            bucket_count >>= 1;
-        }
-
-        HashTable ht;
-        if (!ht_init(&ht, &arena, bucket_count)) {
-            fprintf(stderr, "[ERROR] hash arena too small for buckets (%zu)\n", bucket_count);
-            exit(EXIT_FAILURE);
-        }
-
-        /* ---- insert all left records into hash table ---- */
-        int rid = 0;
-        for (int bi = 0; bi < chunk_blocks; bi++) {
-            char **blk_recs = &left_recs[(size_t)bi * (size_t)max_left_recs];
-            for (int i = 0; i < left_counts[bi]; i++) {
-                char keyL[256];
-                get_field(blk_recs[i], left->header.key_index, keyL, sizeof(keyL));
-                uint64_t h = hash_string64(keyL);
-
-                if (!ht_insert(&ht, &arena, h, blk_recs[i], &matched[rid])) {
-                    fprintf(stderr, "[ERROR] hash arena overflow while inserting left records\n");
-                    exit(EXIT_FAILURE);
-                }
-                rid++;
-            }
-        }
-
-        /* ---- scan right once for this chunk ---- */
+        /* ---- open right from beginning (RESCAN) ---- */
         FILE *rf = fopen(right->filename, "r");
         if (!rf) { perror("fopen right"); exit(EXIT_FAILURE); }
         setvbuf(rf, inR_buf, _IOFBF, io.in_buf_sz);
-
         right_scan_passes++;
 
-        PendingLine pendR = {0};
+        RightIter rit;
+        ri_init(&rit, rf, B_R, blkR, recsR, max_right_recs);
 
-        while (1) {
-            int rc = 0;
+        /* skip right until key >= min_key */
+        char keyR[256];
+        keyR[0] = 0;
+        while (ri_peek_key(right, &rit, keyR, sizeof(keyR))) {
+            if (key_compare(keyR, min_key) >= 0) break;
+            ri_advance(&rit);
+        }
 
-            struct timespec tr1, tr2;
-            clock_gettime(CLOCK_MONOTONIC, &tr1);
-            int ok = fill_block(rf, B_R, right_blk, right_recs, &rc, &pendR, max_right_recs);
-            clock_gettime(CLOCK_MONOTONIC, &tr2);
-            g_time_read += diff_sec(&tr1, &tr2);
+        /* block counts: include skipped reads too */
+        right_blocks_this_pass = rit.blocks_read;
 
-            if (!ok || rc == 0) break;
+        /* ---- merge within [min_key, max_key] ---- */
+        LeftCur lc;
+        lc.bi = 0; lc.ri = 0;
 
-            right_blocks_total++;
-            right_blocks_this_pass++;
+        char keyL[256];
+        keyL[0] = 0;
 
-            for (int j = 0; j < rc; j++) {
-                char keyR[256];
-                get_field(right_recs[j], right->header.key_index, keyR, sizeof(keyR));
-                uint64_t h = hash_string64(keyR);
-                size_t b = (size_t)(h & (ht.bucket_count - 1));
+        /* load first left key */
+        if (lc_has(&lc, chunk_blocks, left_counts)) {
+            get_field(lc_get_rec(&lc, left_recs, max_left_recs), left->header.key_index, keyL, sizeof(keyL));
+        }
 
-                /* probe chain */
-                for (HashNode *n = ht.buckets[b]; n; n = n->next) {
-                    if (n->h != h) continue;
-
-                    /* collision check */
-                    char keyL2[256];
-                    get_field(n->left_rec, left->header.key_index, keyL2, sizeof(keyL2));
-                    if (strcmp(keyL2, keyR) != 0) continue;
-
-                    char right_nonkey[4096];
-                    build_nonkey_fields(right, right_recs[j], right_nonkey, sizeof(right_nonkey));
+        while (lc_has(&lc, chunk_blocks, left_counts)) {
+            /* If right EOF -> rest left are NULL */
+            if (!ri_peek_key(right, &rit, keyR, sizeof(keyR))) {
+                /* output remaining left as NULL */
+                while (lc_has(&lc, chunk_blocks, left_counts)) {
+                    char *lrec = lc_get_rec(&lc, left_recs, max_left_recs);
 
                     struct timespec tw1, tw2;
                     clock_gettime(CLOCK_MONOTONIC, &tw1);
-                    fputs(n->left_rec, out);
-                    fputs(right_nonkey, out);
+                    fputs(lrec, out);
+                    for (int k = 0; k < nonkey_cnt; k++) fputs("NULL|", out);
                     fputc('\n', out);
                     clock_gettime(CLOCK_MONOTONIC, &tw2);
                     g_time_write += diff_sec(&tw1, &tw2);
 
-                    *(n->matched_flag) = 1;
+                    left_null_rows++;
+                    lc_advance(&lc, chunk_blocks, left_counts);
                 }
+                break;
+            }
+
+            /* If right key already beyond max_key -> no more matches for this chunk */
+            if (key_compare(keyR, max_key) > 0) {
+                while (lc_has(&lc, chunk_blocks, left_counts)) {
+                    char *lrec = lc_get_rec(&lc, left_recs, max_left_recs);
+
+                    struct timespec tw1, tw2;
+                    clock_gettime(CLOCK_MONOTONIC, &tw1);
+                    fputs(lrec, out);
+                    for (int k = 0; k < nonkey_cnt; k++) fputs("NULL|", out);
+                    fputc('\n', out);
+                    clock_gettime(CLOCK_MONOTONIC, &tw2);
+                    g_time_write += diff_sec(&tw1, &tw2);
+
+                    left_null_rows++;
+                    lc_advance(&lc, chunk_blocks, left_counts);
+                }
+                break;
+            }
+
+            /* current left key */
+            char *lrec0 = lc_get_rec(&lc, left_recs, max_left_recs);
+            get_field(lrec0, left->header.key_index, keyL, sizeof(keyL));
+
+            int cmp = key_compare(keyL, keyR);
+
+            if (cmp < 0) {
+                /* left key < right key => left unmatched */
+                struct timespec tw1, tw2;
+                clock_gettime(CLOCK_MONOTONIC, &tw1);
+                fputs(lrec0, out);
+                for (int k = 0; k < nonkey_cnt; k++) fputs("NULL|", out);
+                fputc('\n', out);
+                clock_gettime(CLOCK_MONOTONIC, &tw2);
+                g_time_write += diff_sec(&tw1, &tw2);
+
+                left_null_rows++;
+                lc_advance(&lc, chunk_blocks, left_counts);
+                continue;
+            }
+
+            if (cmp > 0) {
+                /* right key < left key => skip right */
+                right_skips++;
+                ri_advance(&rit);
+                continue;
+            }
+
+            /* -----------------------------------------------------------------
+             * key 동일: right group 수집 후 left group과 결합 출력
+             *  - group 메모리가 부족하면 spill(tmp)로 전환
+             * ----------------------------------------------------------------- */
+            groups++;
+
+            jarena_reset(&garena);
+
+            /* pointer array capacity (fit safely within arena) */
+            size_t ptr_cap = garena.cap / (sizeof(char*) * 8);
+            if (ptr_cap < 64) ptr_cap = 64;
+            if (ptr_cap > 65536) ptr_cap = 65536;
+
+            char **rg_ptrs = (char**)jarena_alloc(&garena, ptr_cap * sizeof(char*), sizeof(void*));
+            size_t rg_cnt = 0;
+
+            int spill_mode = 0;
+            FILE *spill = NULL;
+            char spill_path[128];
+            spill_path[0] = '\0';
+            char *spill_buf = spill_iobuf;
+
+            /* capture current key (copy) */
+            char curk[256];
+            snprintf(curk, sizeof(curk), "%s", keyR);
+
+            /* right group: consume all right rows with key==curk */
+            size_t rg_total = 0;
+            while (ri_peek_key(right, &rit, keyR, sizeof(keyR)) && key_compare(keyR, curk) == 0) {
+                char nonkey[4096];
+                build_nonkey_fields(right, ri_peek_rec(&rit), nonkey, sizeof(nonkey));
+
+                if (!spill_mode) {
+                    char *s = jarena_strdup_s(&garena, nonkey);
+
+                    if (!rg_ptrs || !s || rg_cnt >= ptr_cap) {
+                        /* switch to spill: dump what we have */
+                        spill_mode = 1;
+                        snprintf(spill_path, sizeof(spill_path), "rg_spill_%zu_%s.tmp", chunk_passes, curk);
+                        spill = fopen(spill_path, "w+");
+                        if (!spill) { perror("fopen spill"); exit(EXIT_FAILURE); }
+                        setvbuf(spill, spill_buf, _IOFBF, spill_iobuf_sz);
+
+                        /* dump already stored */
+                        for (size_t i = 0; i < rg_cnt; i++) {
+                            fputs(rg_ptrs[i], spill);
+                            fputc('\n', spill);
+                        }
+                        /* dump current */
+                        fputs(nonkey, spill);
+                        fputc('\n', spill);
+                    } else {
+                        rg_ptrs[rg_cnt++] = s;
+                    }
+                } else {
+                    fputs(nonkey, spill);
+                    fputc('\n', spill);
+                }
+
+                rg_total++;
+                ri_advance(&rit);
+            }
+
+            if (rg_total > max_right_group) max_right_group = rg_total;
+            right_blocks_this_pass = rit.blocks_read;
+
+            /* left group: process all left rows with key==curk */
+            while (lc_has(&lc, chunk_blocks, left_counts)) {
+                char *lrec = lc_get_rec(&lc, left_recs, max_left_recs);
+                get_field(lrec, left->header.key_index, keyL, sizeof(keyL));
+                if (key_compare(keyL, curk) != 0) break;
+
+                if (!spill_mode) {
+                    /* output all combinations from in-memory right group */
+                    for (size_t i = 0; i < rg_cnt; i++) {
+                        struct timespec tw1, tw2;
+                        clock_gettime(CLOCK_MONOTONIC, &tw1);
+                        fputs(lrec, out);
+                        fputs(rg_ptrs[i], out);
+                        fputc('\n', out);
+                        clock_gettime(CLOCK_MONOTONIC, &tw2);
+                        g_time_write += diff_sec(&tw1, &tw2);
+                    }
+                } else {
+                    /* spill replay */
+                    fflush(spill);
+                    fseek(spill, 0, SEEK_SET);
+
+                    char line[4096 + 8];
+                    while (fgets(line, sizeof(line), spill)) {
+                        size_t n = strlen(line);
+                        if (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[n - 1] = '\0';
+
+                        struct timespec tw1, tw2;
+                        clock_gettime(CLOCK_MONOTONIC, &tw1);
+                        fputs(lrec, out);
+                        fputs(line, out);
+                        fputc('\n', out);
+                        clock_gettime(CLOCK_MONOTONIC, &tw2);
+                        g_time_write += diff_sec(&tw1, &tw2);
+                    }
+                }
+
+                lc_advance(&lc, chunk_blocks, left_counts);
+            }
+
+            if (spill_mode) {
+                fclose(spill);
+                remove(spill_path);
             }
         }
 
-        /* PendingLine이 내부에서 malloc을 쓴다면 누수 방지 */
-        pendingline_free_local(&pendR);
+        /* finalize pass counters */
+        right_blocks_this_pass = rit.blocks_read;
+        right_blocks_total += (int)right_blocks_this_pass;
+
+        pendingline_free_local(&rit.pend);
         fclose(rf);
 
         /* pass 로그(너무 많이 찍히는 것 방지: 앞 5회 + 10회마다) */
         if (chunk_passes <= 5 || (chunk_passes % 10 == 0)) {
-            printf("[INFO] pass=%zu/%zu (expected~%zu), chunk_blocks=%d, left_recs=%d, right_blocks_this_pass=%zu\n",
+            printf("[INFO] pass=%zu/%zu (expected~%zu), chunk_blocks=%d, left_recs=%d, key_range=[%s..%s], right_blocks_this_pass=%zu\n",
                    chunk_passes,
-                   (expected_passes ? expected_passes : 0),
+                   expected_passes,
                    expected_passes,
                    chunk_blocks,
                    total_left_recs,
+                   min_key, max_key,
                    right_blocks_this_pass);
-        }
-
-        /* ---- emit unmatched left records with NULLs ---- */
-        rid = 0;
-        for (int bi = 0; bi < chunk_blocks; bi++) {
-            char **blk_recs = &left_recs[(size_t)bi * (size_t)max_left_recs];
-            for (int i = 0; i < left_counts[bi]; i++) {
-                if (matched[rid] == 0) {
-                    struct timespec tw1, tw2;
-                    clock_gettime(CLOCK_MONOTONIC, &tw1);
-
-                    fputs(blk_recs[i], out);
-                    for (int k = 0; k < nonkey_cnt; k++) fputs("NULL|", out);
-                    fputc('\n', out);
-
-                    clock_gettime(CLOCK_MONOTONIC, &tw2);
-                    g_time_write += diff_sec(&tw1, &tw2);
-                }
-                rid++;
-            }
         }
     }
 
@@ -478,9 +688,10 @@ void left_join_strategyB(const Table *left,
     fclose(lf);
     fclose(out);
 
-    /* 최종 요약 로그 */
-    printf("[INFO] SUMMARY: chunk_passes=%zu, right_scan_passes=%zu, total_left_blocks=%d, total_right_blocks=%d\n",
-           chunk_passes, right_scan_passes, left_blocks_total, right_blocks_total);
+    /* right_blocks_total은 "재스캔 기반"이므로 매우 커질 수 있음(의도된 실험 포인트) */
+    printf("[INFO] SUMMARY: chunk_passes=%zu, right_scan_passes=%zu, groups=%zu, max_right_group=%zu, left_null_rows=%zu, right_skips=%zu, Lblocks=%d, Rblocks=%d\n",
+           chunk_passes, right_scan_passes, groups, max_right_group, left_null_rows, right_skips,
+           left_blocks_total, right_blocks_total);
 
     clock_gettime(CLOCK_MONOTONIC, &tj_end);
     double total = diff_sec(&tj_start, &tj_end);

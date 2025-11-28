@@ -29,5 +29,5 @@ main에 일단 모든 코드 몰아넣었음 -> 모듈화 예정
 사용 코드
 
 ./main.out 메모리제한(MB) 파일명 메타데이터 파일블록크기 ... 조인키
-./main.out 2 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 10000 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 10000 partkey
+./main.out 64 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 1024 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 1024 partkey
 part.tbl, partsupp.tbl 파일 TPC에서 가져와서 사용하면 됨
