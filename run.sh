@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-RUNS=3
+RUNS=1
 
 LEFT_FILE="part.tbl"
 LEFT_SCHEMA="partkey,name,mfgr,brand,type,size,container,retailprice,comment"
@@ -107,11 +107,11 @@ avg_tc() {
 }
 
 # ---- 실행할 블록 (TC별 MM 지정) ----
-avg_tc "M1" 32  8192  8192
-avg_tc "M2" 64  8192  8192
-avg_tc "M3" 128  8192  8192
-avg_tc "M4" 256  8192  8192
-avg_tc "M5" 512  8192  8192
+avg_tc "MS1" 32  8192  8192
+avg_tc "MS2" 64  8192  8192
+avg_tc "MS3" 128  8192  8192
+avg_tc "MS4" 256  8192  8192
+avg_tc "MS5" 512  8192  8192
 
 # 예시: TC별로 MM 바꾸려면 이렇게 추가
 # avg_tc "M1" 128 4096 4096
