@@ -51,6 +51,12 @@ static unsigned int clamp_u32(unsigned int v, unsigned int lo, unsigned int hi) 
     return v;
 }
 
+static size_t clamp_zu(size_t v, size_t lo, size_t hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 static void* arena_calloc_local(Arena *a, size_t n, size_t sz) {
     size_t bytes = n * sz;
     void *p = arena_alloc(a, bytes);
@@ -72,52 +78,102 @@ typedef struct {
     size_t out_buf_sz;
     size_t inL_buf_sz;
     size_t inR_buf_sz;
-    size_t part_buf_sz;
-    size_t total_bytes; /* out + inL + inR + part(2P) */
+    size_t part_buf_sz;   /* per partition file */
+    size_t total_bytes;   /* out + inL + inR + part(2P) */
 } IoBufPlanP;
 
-static IoBufPlanP plan_iobuf_partition(size_t max_mem, unsigned int P) {
+/*
+ * NEW plan:
+ * - buffer sizes depend on B_L/B_R so your TC(B) sweep can actually change IO behavior.
+ * - remove hard 1MB caps; only constrained by (a) io_budget and (b) reasonable upper bounds.
+ * - io_budget is a fraction of max_mem, but can grow beyond 8MB (previous cap).
+ */
+static IoBufPlanP plan_iobuf_partition(size_t max_mem, unsigned int P, size_t B_L, size_t B_R) {
     IoBufPlanP plan;
     memset(&plan, 0, sizeof(plan));
 
-    if (max_mem == 0) {
-        plan.out_buf_sz  = 1 << 20;  /* 1MB */
-        plan.inL_buf_sz  = 1 << 20;  /* 1MB */
-        plan.inR_buf_sz  = 1 << 20;  /* 1MB */
-        plan.part_buf_sz = 16 << 10; /* 16KB */
-        plan.total_bytes = plan.out_buf_sz + plan.inL_buf_sz + plan.inR_buf_sz
-                         + plan.part_buf_sz * (size_t)(2 * P);
-        return plan;
+    const size_t bmax = (B_L > B_R) ? B_L : B_R;
+
+    /* If max_mem==0 (unlimited mode), pick a pragmatic default budget. */
+    size_t io_budget = (max_mem == 0) ? (64ULL << 20) : (max_mem / 8);   /* 12.5% */
+    /* budget lower bound: at least enough for a few blocks worth of buffering */
+    size_t min_budget = 16 * (B_L + B_R + bmax);
+    if (min_budget < 64 * 1024) min_budget = 64 * 1024;
+    /* budget upper bound: avoid ridiculous buffers even if max_mem is huge */
+    size_t max_budget = 256ULL << 20; /* 256MB */
+    io_budget = clamp_zu(io_budget, min_budget, max_budget);
+
+    /* per-stream minimums: at least one block */
+    size_t min_out = (bmax ? bmax : (16 * 1024));
+    size_t min_inL = (B_L  ? B_L  : (16 * 1024));
+    size_t min_inR = (B_R  ? B_R  : (16 * 1024));
+
+    /* per-stream targets: N blocks worth (you can tune these multipliers) */
+    size_t out_target = bmax * 32;   /* output tends to be write-heavy */
+    size_t inL_target = B_L  * 16;
+    size_t inR_target = B_R  * 16;
+
+    /* round up to pow2 for stable step changes across B sweep */
+    size_t out_buf = next_pow2(out_target);
+    size_t inL_buf = next_pow2(inL_target);
+    size_t inR_buf = next_pow2(inR_target);
+
+    /* keep some sane per-stream upper bounds */
+    size_t per_stream_max = 64ULL << 20; /* 64MB */
+    out_buf = clamp_zu(out_buf, min_out, per_stream_max);
+    inL_buf = clamp_zu(inL_buf, min_inL, per_stream_max);
+    inR_buf = clamp_zu(inR_buf, min_inR, per_stream_max);
+
+    /*
+     * Fit core buffers into io_budget.
+     * If over, shrink the largest one by /2 until it fits or hits its minimum.
+     */
+    for (int it = 0; it < 64; it++) {
+        size_t core = out_buf + inL_buf + inR_buf;
+        if (core <= io_budget) break;
+
+        /* find current largest buffer */
+        if (out_buf >= inL_buf && out_buf >= inR_buf && out_buf > min_out) {
+            out_buf >>= 1;
+            if (out_buf < min_out) out_buf = min_out;
+        } else if (inL_buf >= out_buf && inL_buf >= inR_buf && inL_buf > min_inL) {
+            inL_buf >>= 1;
+            if (inL_buf < min_inL) inL_buf = min_inL;
+        } else if (inR_buf > min_inR) {
+            inR_buf >>= 1;
+            if (inR_buf < min_inR) inR_buf = min_inR;
+        } else {
+            /* cannot shrink further */
+            break;
+        }
     }
 
-    size_t io_budget = max_mem / 16;              /* 6.25% */
-    if (io_budget < 128 * 1024) io_budget = 128 * 1024;
-    if (io_budget > (8ULL << 20)) io_budget = 8ULL << 20;
+    /* remaining for partition file buffers (pool = 2*P buffers) */
+    size_t used_core = out_buf + inL_buf + inR_buf;
+    size_t remain = (io_budget > used_core) ? (io_budget - used_core) : 0;
 
-    size_t out_buf = io_budget / 2;
-    size_t in_each = io_budget / 8;
+    size_t part_each = 0;
+    if (P > 0 && remain > 0) {
+        part_each = remain / (size_t)(2 * P);
 
-    if (out_buf < 64 * 1024) out_buf = 64 * 1024;
-    if (out_buf > (1 << 20)) out_buf = 1 << 20;
+        /* limit extremes: too small is not useful; too big explodes pool */
+        if (part_each > (1ULL << 20)) part_each = (1ULL << 20);  /* 1MB per partition file */
+        /* allow small when P is huge; but avoid setvbuf(0) */
+        if (part_each < 256) part_each = remain / (size_t)(2 * P); /* may be 0 */
+        if (part_each > 0 && part_each < 256) part_each = 256;
 
-    if (in_each < 64 * 1024) in_each = 64 * 1024;
-    if (in_each > (1 << 20)) in_each = 1 << 20;
-
-    size_t used = out_buf + 2 * in_each;
-    size_t remain = (io_budget > used) ? (io_budget - used) : 0;
-
-    size_t part_buf = 0;
-    if (P > 0) {
-        part_buf = remain / (size_t)(2 * P);
-        if (part_buf < 256) part_buf = 256;
-        if (part_buf > 64 * 1024) part_buf = 64 * 1024;
+        /* ensure pool total doesn't exceed remain */
+        if ((size_t)(2 * P) * part_each > remain) {
+            part_each = remain / (size_t)(2 * P);
+            if (part_each > 0 && part_each < 256) part_each = 256;
+        }
     }
 
     plan.out_buf_sz  = out_buf;
-    plan.inL_buf_sz  = in_each;
-    plan.inR_buf_sz  = in_each;
-    plan.part_buf_sz = part_buf;
-    plan.total_bytes = out_buf + in_each + in_each + part_buf * (size_t)(2 * P);
+    plan.inL_buf_sz  = inL_buf;
+    plan.inR_buf_sz  = inR_buf;
+    plan.part_buf_sz = part_each;
+    plan.total_bytes = out_buf + inL_buf + inR_buf + part_each * (size_t)(2 * P);
     return plan;
 }
 
@@ -200,7 +256,7 @@ void left_join_strategyB(const Table *left,
             newP = clamp_u32(newP, 1u, 256u);
         }
 
-        IoBufPlanP newIo = plan_iobuf_partition(g_max_memory_bytes, newP);
+        IoBufPlanP newIo = plan_iobuf_partition(g_max_memory_bytes, newP, B_L, B_R);
         if (it > 0 && newP == P && newIo.total_bytes == io.total_bytes) break;
 
         P = newP;
