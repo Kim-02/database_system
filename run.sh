@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-RUNS=1
+RUNS=3
+OMP_THREADS=4
 
 LEFT_FILE="part.tbl"
 LEFT_SCHEMA="partkey,name,mfgr,brand,type,size,container,retailprice,comment"
@@ -43,6 +44,10 @@ run_one() {
   (
     cd "$workdir"
     export TMPDIR="$workdir"
+    export OMP_NUM_THREADS="$OMP_THREADS"
+    export OMP_PROC_BIND=true
+    export OMP_PLACES=cores
+
     "$MAIN_BIN" "$mm" \
       "$LEFT_ABS"  "$LEFT_SCHEMA"  "$bl" \
       "$RIGHT_ABS" "$RIGHT_SCHEMA" "$br" \
@@ -64,14 +69,14 @@ extract_metric() {
 avg_tc() {
   local tc="$1" mm="$2" bl="$3" br="$4"
 
-  local log="$ORIG_DIR/AR3log_${tc}_MM${mm}.log"
-  local results="$ORIG_DIR/results.tsv"
+  local log="$ORIG_DIR/AR3log_${tc}_OMP${OMP_THREADS}_MM${mm}.log"
+  local results="$ORIG_DIR/results_omp${OMP_THREADS}.tsv"
 
   local sum_elapsed=0 sum_read=0 sum_join=0 sum_write=0
   local last_out=""
 
   for i in $(seq 1 "$RUNS"); do
-    echo "==== $tc RUN $i (MM=$mm B_L=$bl B_R=$br) ====" | tee -a "$log"
+    echo "==== $tc RUN $i (OMP=$OMP_THREADS MM=$mm B_L=$bl B_R=$br) ====" | tee -a "$log"
     drop_caches
 
     last_out="$(run_one "$tc" "$i" "$mm" "$bl" "$br")"
@@ -97,22 +102,30 @@ avg_tc() {
   avg_join="$(awk    -v s="$sum_join"    -v n="$RUNS" 'BEGIN{printf "%.6f", s/n}')"
   avg_write="$(awk   -v s="$sum_write"   -v n="$RUNS" 'BEGIN{printf "%.6f", s/n}')"
 
-  # results.tsv는 누적 기록
   if [[ ! -f "$results" ]]; then
-    echo -e "TC\tMM\tB_L\tB_R\tElapsed time\tRead time\tJoin time\tWrite time" > "$results"
+    echo -e "TC\tOMP\tMM\tB_L\tB_R\tElapsed time\tRead time\tJoin time\tWrite time" > "$results"
   fi
 
-  printf "%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n" \
-    "$tc" "$mm" "$bl" "$br" "$avg_elapsed" "$avg_read" "$avg_join" "$avg_write" | tee -a "$results"
+  printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n" \
+    "$tc" "$OMP_THREADS" "$mm" "$bl" "$br" "$avg_elapsed" "$avg_read" "$avg_join" "$avg_write" | tee -a "$results"
 }
 
 # ---- 실행할 블록 (TC별 MM 지정) ----
-avg_tc "MS1" 32  8192  8192
-avg_tc "MS2" 64  8192  8192
-avg_tc "MS3" 128  8192  8192
-avg_tc "MS4" 256  8192  8192
-avg_tc "MS5" 512  8192  8192
+avg_tc "S1"	256	1024	1024	
+avg_tc "S2"	256	2048	2048	
+avg_tc "S3"	256	4096	4096	
+avg_tc "S4"	256	8192	8192	
+avg_tc "S5"	256	16384	16384	
+avg_tc "S6"	256	32768	32768	
 
-# 예시: TC별로 MM 바꾸려면 이렇게 추가
-# avg_tc "M1" 128 4096 4096
-# avg_tc "M2" 512 4096 4096
+avg_tc "R1"	256	4096	1024	
+avg_tc "R2"	256	4096	2048	
+avg_tc "R3"	256	4096	4096	
+avg_tc "R4"	256	4096	8192	
+avg_tc "R5"	256	4096	16384
+
+avg_tc "L1"	256	1024	4096	
+avg_tc "L2"	256	2048	4096	
+avg_tc "L3"	256	4096	4096	
+avg_tc "L4"	256	8192	4096	
+avg_tc "L5"	256	16384	4096
