@@ -14,7 +14,7 @@ static void parse_header(const char *header_str, TableHeader *hdr) {
     char *token = strtok(buf, ",");
     while (token && hdr->num_columns < MAX_COLUMNS) {
         while (*token == ' ' || *token == '\t') token++;
-        char *end = token + strlen(token) - 1;
+        char *end = token + (int)strlen(token) - 1;
         while (end >= token && (*end == ' ' || *end == '\t')) {
             *end = '\0';
             end--;
@@ -46,8 +46,14 @@ void table_init(Table *tbl,
                 const char *join_col_name)
 {
     memset(tbl, 0, sizeof(*tbl));
+
+    /* 기존 필드 */
     strncpy(tbl->filename, filename, sizeof(tbl->filename) - 1);
     tbl->filename[sizeof(tbl->filename) - 1] = '\0';
+
+    /* 추가된 path 필드 (join.c 호환) */
+    strncpy(tbl->path, filename, sizeof(tbl->path) - 1);
+    tbl->path[sizeof(tbl->path) - 1] = '\0';
 
     parse_header(header_str, &tbl->header);
     int key_idx = find_column_index(&tbl->header, join_col_name);

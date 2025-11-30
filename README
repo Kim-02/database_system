@@ -31,3 +31,9 @@ main에 일단 모든 코드 몰아넣었음 -> 모듈화 예정
 ./main.out 메모리제한(MB) 파일명 메타데이터 파일블록크기 ... 조인키
 ./main.out 128 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 16384 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 16384 partkey
 part.tbl, partsupp.tbl 파일 TPC에서 가져와서 사용하면 됨
+
+
+---------
+omp 사용방법
+make clean - make OMP=1
+OMP_NUM_THREADS=4 ./main.out 128 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 16384 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 16384 partkey

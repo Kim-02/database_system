@@ -17,14 +17,9 @@ double g_time_read  = 0.0;
 double g_time_join  = 0.0;
 double g_time_write = 0.0;
 
+/* 시간 차이 계산 */
 static double diff_sec(const struct timespec *s, const struct timespec *e) {
     return (e->tv_sec - s->tv_sec) + (e->tv_nsec - s->tv_nsec) / 1e9;
-}
-
-static void reset_timers_local(void) {
-    g_time_read = 0.0;
-    g_time_join = 0.0;
-    g_time_write = 0.0;
 }
 
 /* pendingline_free() 심볼 없을 때를 대비한 로컬 해제 */
@@ -56,7 +51,29 @@ static unsigned int clamp_u32(unsigned int v, unsigned int lo, unsigned int hi) 
     return v;
 }
 
-static void* arena_calloc_local(Arena *a, size_t n, size_t sz) {
+static void reset_timers_local(void) {
+    g_time_read = g_time_join = g_time_write = 0.0;
+}
+
+/* hash node stored in arena */
+typedef struct HashNode {
+    uint64_t        h;
+    char           *key;
+    char           *nonkey;
+    struct HashNode *next;
+} HashNode;
+
+/* I/O buffer plan */
+typedef struct IOPlan {
+    size_t out_buf_sz;
+    size_t inL_buf_sz;
+    size_t inR_buf_sz;
+    size_t part_buf_sz;   /* per-partition-file buffer size (one for left, one for right → 2*P개) */
+    size_t total_bytes;   /* out+inL+inR + (part_buf_sz * 2 * P) */
+} IOPlan;
+
+/* arena calloc helper */
+static void *arena_calloc(Arena *a, size_t n, size_t sz) {
     size_t bytes = n * sz;
     void *p = arena_alloc(a, bytes);
     if (!p) return NULL;
@@ -64,25 +81,33 @@ static void* arena_calloc_local(Arena *a, size_t n, size_t sz) {
     return p;
 }
 
-/* hash node stored in arena */
-typedef struct HashNode {
-    uint64_t h;
-    char *key;
-    char *nonkey;
-    struct HashNode *next;
-} HashNode;
+/* 고정 상수 */
+#ifndef PART_PATH_LEN
+#define PART_PATH_LEN 256
+#endif
 
-/* I/O buffer plan: all buffers come from big_alloc so they count to max_mem */
-typedef struct {
-    size_t out_buf_sz;
-    size_t inL_buf_sz;
-    size_t inR_buf_sz;
-    size_t part_buf_sz;
-    size_t total_bytes; /* out + inL + inR + part(2P) */
-} IoBufPlanP;
+#ifndef MIN_REC_BYTES
+#define MIN_REC_BYTES 2
+#endif
 
-static IoBufPlanP plan_iobuf_partition(size_t max_mem, unsigned int P) {
-    IoBufPlanP plan;
+/* P에 따라 big_alloc로 추가로 잡히는 메타데이터(경로/포인터/카운트) 크기 */
+static size_t estimate_partition_meta_bytes(unsigned int P) {
+    size_t bytes = 0;
+    bytes += (size_t)(2 * P) * (size_t)PART_PATH_LEN;   /* left/right paths */
+    bytes += (size_t)(2 * P) * sizeof(FILE*);           /* lfp/rfp */
+    bytes += (size_t)(2 * P) * sizeof(size_t);          /* left/right rec counts */
+    return bytes;
+}
+
+/* I/O 버퍼 크기 결정: 이미 big_alloc으로 잡힌 용량(g_big_alloc_bytes)와
+   partition 메타(meta_bytes), safety 등을 고려해서 out/inL/inR/part_buf 크기를 정함 */
+static IOPlan choose_ioplan(size_t max_mem,
+                            size_t used_so_far,
+                            size_t meta_bytes,
+                            size_t safety,
+                            unsigned int P)
+{
+    IOPlan plan;
     memset(&plan, 0, sizeof(plan));
 
     if (max_mem == 0) {
@@ -99,46 +124,41 @@ static IoBufPlanP plan_iobuf_partition(size_t max_mem, unsigned int P) {
     if (io_budget < 128 * 1024) io_budget = 128 * 1024;
     if (io_budget > (8ULL << 20)) io_budget = 8ULL << 20;
 
-    size_t out_buf = io_budget / 2;
-    size_t in_each = io_budget / 8;
+    size_t per_stream = io_budget / 4;
+    if (per_stream < 64 * 1024) per_stream = 64 * 1024;
 
-    if (out_buf < 64 * 1024) out_buf = 64 * 1024;
-    if (out_buf > (1 << 20)) out_buf = 1 << 20;
+    plan.out_buf_sz  = per_stream;
+    plan.inL_buf_sz  = per_stream;
+    plan.inR_buf_sz  = per_stream;
 
-    if (in_each < 64 * 1024) in_each = 64 * 1024;
-    if (in_each > (1 << 20)) in_each = 1 << 20;
+    size_t part_budget = io_budget / 4;
+    size_t part_each   = (P > 0) ? (part_budget / (2 * (size_t)P)) : (16 * 1024);
+    if (part_each < 16 * 1024) part_each = 16 * 1024;
 
-    size_t used = out_buf + 2 * in_each;
-    size_t remain = (io_budget > used) ? (io_budget - used) : 0;
+    plan.part_buf_sz = part_each;
 
-    size_t part_buf = 0;
-    if (P > 0) {
-        part_buf = remain / (size_t)(2 * P);
-        if (part_buf < 256) part_buf = 256;
-        if (part_buf > 64 * 1024) part_buf = 64 * 1024;
-    }
+    /* HARD CAP: 너무 크게 잡히지 않도록 상한 */
+    const size_t MAX_STREAM_BUF = 1ULL << 20;   /* 1MB */
+    const size_t MAX_PART_BUF   = 256ULL << 10; /* 256KB */
 
-    plan.out_buf_sz  = out_buf;
-    plan.inL_buf_sz  = in_each;
-    plan.inR_buf_sz  = in_each;
-    plan.part_buf_sz = part_buf;
-    plan.total_bytes = out_buf + in_each + in_each + part_buf * (size_t)(2 * P);
+    if (plan.out_buf_sz  > MAX_STREAM_BUF) plan.out_buf_sz  = MAX_STREAM_BUF;
+    if (plan.inL_buf_sz  > MAX_STREAM_BUF) plan.inL_buf_sz  = MAX_STREAM_BUF;
+    if (plan.inR_buf_sz  > MAX_STREAM_BUF) plan.inR_buf_sz  = MAX_STREAM_BUF;
+    if (plan.part_buf_sz > MAX_PART_BUF)   plan.part_buf_sz= MAX_PART_BUF;
+
+    /* 최소 보장 */
+    if (plan.out_buf_sz  < 64 * 1024)  plan.out_buf_sz  = 64 * 1024;
+    if (plan.inL_buf_sz  < 64 * 1024)  plan.inL_buf_sz  = 64 * 1024;
+    if (plan.inR_buf_sz  < 64 * 1024)  plan.inR_buf_sz  = 64 * 1024;
+    if (plan.part_buf_sz < 16 * 1024)  plan.part_buf_sz = 16 * 1024;
+
+    plan.total_bytes = plan.out_buf_sz + plan.inL_buf_sz + plan.inR_buf_sz
+                     + plan.part_buf_sz * (size_t)(2 * P);
+
     return plan;
 }
 
-#ifndef PART_PATH_LEN
-#define PART_PATH_LEN 64
-#endif
-
-/* P에 따라 big_alloc로 추가로 잡히는 메타데이터(경로/포인터/카운트) 크기 */
-static size_t estimate_partition_meta_bytes(unsigned int P) {
-    size_t bytes = 0;
-    bytes += (size_t)(2 * P) * (size_t)PART_PATH_LEN;   /* left/right paths */
-    bytes += (size_t)(2 * P) * sizeof(FILE*);           /* lfp/rfp */
-    bytes += (size_t)(2 * P) * sizeof(size_t);          /* left/right rec counts */
-    return bytes;
-}
-
+/* 메인 조인 함수 */
 void left_join_strategyB(const Table *left,
                          const Table *right,
                          const char *output_path,
@@ -155,115 +175,77 @@ void left_join_strategyB(const Table *left,
 
     if (B_L < sizeof(BlockHeader) + sizeof(uint16_t) + MIN_REC_BYTES ||
         B_R < sizeof(BlockHeader) + sizeof(uint16_t) + MIN_REC_BYTES) {
-        fprintf(stderr, "[ERROR] block_size too small: B_L=%zu, B_R=%zu\n", B_L, B_R);
+        fprintf(stderr,
+                "[ERROR] block size too small. Need header + at least one record.\n");
         exit(EXIT_FAILURE);
     }
 
-    int max_left_recs  = (int)(B_L / (sizeof(uint16_t) + MIN_REC_BYTES));
-    int max_right_recs = (int)(B_R / (sizeof(uint16_t) + MIN_REC_BYTES));
-    if (max_left_recs <= 0 || max_right_recs <= 0) {
-        fprintf(stderr, "[ERROR] invalid max recs: L=%d R=%d\n", max_left_recs, max_right_recs);
-        exit(EXIT_FAILURE);
-    }
+    /* === 1. 기본 블록/레코드 포인터 배열을 big_alloc으로 잡음 === */
+    int max_left_recs  = (int)(B_L / (size_t)(sizeof(uint16_t) + MIN_REC_BYTES));
+    int max_right_recs = (int)(B_R / (size_t)(sizeof(uint16_t) + MIN_REC_BYTES));
+    if (max_left_recs  < 64) max_left_recs  = 64;
+    if (max_right_recs < 64) max_right_recs = 64;
 
-    struct stat stL, stR;
-    size_t left_file_size  = 0;
-    size_t right_file_size = 0;
-    if (stat(left->filename, &stL) == 0)  left_file_size  = (size_t)stL.st_size;
-    if (stat(right->filename, &stR) == 0) right_file_size = (size_t)stR.st_size;
-
-    size_t est_left_blocks  = (left_file_size  > 0) ? ((left_file_size  + B_L - 1) / B_L) : 0;
-    size_t est_right_blocks = (right_file_size > 0) ? ((right_file_size + B_R - 1) / B_R) : 0;
-
-    /* fixed buffers (big_alloc) */
     Block *blkL = (Block*)big_alloc(B_L);
     Block *blkR = (Block*)big_alloc(B_R);
+
     char **recsL = (char**)big_alloc(sizeof(char*) * (size_t)max_left_recs);
     char **recsR = (char**)big_alloc(sizeof(char*) * (size_t)max_right_recs);
 
-    /* strict에서 안전 여유 */
-    size_t safety = 64 * 1024;
-
-    /* ===== P + I/O plan 결정 (메모리 한도까지 고려) ===== */
-    unsigned int P = 1;
-    IoBufPlanP io;
-    memset(&io, 0, sizeof(io));
-
-    if (right_file_size == 0) {
-        P = 1;
-        io = plan_iobuf_partition(g_max_memory_bytes, P);
-    } else {
-        /* 고정 big_alloc 사용량(현재까지) */
-        size_t used_static = g_big_alloc_bytes;
-
-        /* 반복 수렴: P -> io -> rem -> P */
-        for (int it = 0; it < 8; it++) {
-            IoBufPlanP trialIo = plan_iobuf_partition(g_max_memory_bytes, P);
-            size_t meta_bytes = estimate_partition_meta_bytes(P);
-
-            if (g_max_memory_bytes > 0) {
-                size_t must_fit = used_static + safety + trialIo.total_bytes + meta_bytes;
-                if (must_fit >= g_max_memory_bytes) {
-                    fprintf(stderr,
-                            "[ERROR] max_mem too small (before arena): used=%zu safety=%zu io=%zu meta=%zu limit=%zu\n",
-                            used_static, safety, trialIo.total_bytes, meta_bytes, g_max_memory_bytes);
-                    exit(EXIT_FAILURE);
-                }
-                size_t rem = g_max_memory_bytes - must_fit;
-
-                size_t target_part_disk = rem / 2;
-                if (target_part_disk < 256 * 1024) target_part_disk = 256 * 1024;
-
-                unsigned int newP = (unsigned int)((right_file_size + target_part_disk - 1) / target_part_disk);
-                if (newP < 1) newP = 1;
-                newP = clamp_u32(newP, 1u, 256u);
-
-                if (newP == P) {
-                    io = trialIo;
-                    break;
-                }
-                P = newP;
-                io = trialIo;
-            } else {
-                /* 무제한 모드: 현재 P 유지 */
-                io = trialIo;
-                break;
-            }
-        }
+    struct stat stL, stR;
+    if (stat(left->path, &stL) != 0) {
+        perror("stat left");
+        exit(EXIT_FAILURE);
     }
-
-    /* ===== iobufs + partition 메타를 big_alloc로 먼저 확정 ===== */
-    char *out_iobuf = NULL, *inL_iobuf = NULL, *inR_iobuf = NULL, *part_iobuf_pool = NULL;
-
-    if (io.out_buf_sz) out_iobuf = (char*)big_alloc(io.out_buf_sz);
-    if (io.inL_buf_sz) inL_iobuf = (char*)big_alloc(io.inL_buf_sz);
-    if (io.inR_buf_sz) inR_iobuf = (char*)big_alloc(io.inR_buf_sz);
-
-    if (io.part_buf_sz && P > 0) {
-        part_iobuf_pool = (char*)big_alloc(io.part_buf_sz * (size_t)(2 * P));
+    if (stat(right->path, &stR) != 0) {
+        perror("stat right");
+        exit(EXIT_FAILURE);
     }
+    size_t left_file_size  = (size_t)stL.st_size;
+    size_t right_file_size = (size_t)stR.st_size;
 
-    /* partition arrays via big_alloc (no malloc/calloc) */
-    char (*left_part_paths)[PART_PATH_LEN]  = (char(*)[PART_PATH_LEN])big_alloc((size_t)P * PART_PATH_LEN);
-    char (*right_part_paths)[PART_PATH_LEN] = (char(*)[PART_PATH_LEN])big_alloc((size_t)P * PART_PATH_LEN);
-    FILE **lfp = (FILE**)big_alloc(sizeof(FILE*) * (size_t)P);
-    FILE **rfp = (FILE**)big_alloc(sizeof(FILE*) * (size_t)P);
+    size_t est_left_blocks  = (left_file_size  + B_L - 1) / B_L;
+    size_t est_right_blocks = (right_file_size + B_R - 1) / B_R;
 
-    size_t *right_part_rec_counts = (size_t*)big_alloc(sizeof(size_t) * (size_t)P);
-    size_t *left_part_rec_counts  = (size_t*)big_alloc(sizeof(size_t) * (size_t)P);
-    memset(right_part_rec_counts, 0, sizeof(size_t) * (size_t)P);
-    memset(left_part_rec_counts,  0, sizeof(size_t) * (size_t)P);
+    /* === 2. 파티션 수 P 선택 === */
+    unsigned int P = 8;
+    size_t meta_bytes = estimate_partition_meta_bytes(P);
 
-    /* ===== 이제 남은 메모리로 arena를 만들면 strict가 유지됨 ===== */
-    size_t arena_cap = 0;
+    const size_t safety = 8ULL << 20;  /* 8MB 여유 */
+
+    IOPlan io = choose_ioplan(g_max_memory_bytes,
+                              g_big_alloc_bytes + meta_bytes,
+                              meta_bytes,
+                              safety,
+                              P);
+
     if (g_max_memory_bytes > 0) {
-        if (g_big_alloc_bytes + safety >= g_max_memory_bytes) {
+        size_t must = g_big_alloc_bytes + meta_bytes + io.total_bytes + safety;
+        if (must > g_max_memory_bytes) {
+            /* 파티션 수를 늘려 파티션당 파일 크기를 줄이는 방향 등,
+               여기서는 단순히 에러 처리 */
             fprintf(stderr,
-                    "[ERROR] no room for arena: used=%zu safety=%zu limit=%zu\n",
-                    g_big_alloc_bytes, safety, g_max_memory_bytes);
+                    "[ERROR] Not enough memory even for iobuf+meta: need=%zu limit=%zu\n",
+                    must, g_max_memory_bytes);
             exit(EXIT_FAILURE);
         }
-        arena_cap = g_max_memory_bytes - g_big_alloc_bytes - safety;
+    }
+
+    /* arena 용량: 남은 메모리 전부를 arena로 사용 (없으면 128MB) */
+    size_t arena_cap = 0;
+    if (g_max_memory_bytes > 0) {
+        if (g_big_alloc_bytes + meta_bytes + io.total_bytes + safety >= g_max_memory_bytes) {
+            fprintf(stderr,
+                    "[ERROR] No room for arena: used=%zu meta=%zu io=%zu safety=%zu limit=%zu\n",
+                    g_big_alloc_bytes, meta_bytes, io.total_bytes, safety, g_max_memory_bytes);
+            exit(EXIT_FAILURE);
+        }
+        arena_cap = g_max_memory_bytes - g_big_alloc_bytes - meta_bytes - io.total_bytes - safety;
+        if (arena_cap < (8ULL << 20)) {
+            fprintf(stderr,
+                    "[WARN] arena_cap is small (%zu bytes). Joins may fail for large partitions.\n",
+                    arena_cap);
+        }
     } else {
         arena_cap = 128ULL << 20;
     }
@@ -276,18 +258,70 @@ void left_join_strategyB(const Table *left,
     printf("[INFO] max_left_recs=%d, max_right_recs=%d\n", max_left_recs, max_right_recs);
     printf("[INFO] left_file_size=%zu, right_file_size=%zu\n", left_file_size, right_file_size);
     printf("[INFO] est_left_blocks=%zu, est_right_blocks=%zu\n", est_left_blocks, est_right_blocks);
-    printf("[INFO] P=%u, fixed_big_alloc=%zu, arena_cap=%zu\n", P, g_big_alloc_bytes, arena_cap);
+    printf("[INFO] P=%u, fixed_big_alloc=%zu, arena_cap=%zu\n",
+           P, g_big_alloc_bytes, arena_cap);
     printf("[INFO] iobuf: out=%zu inL=%zu inR=%zu part_each=%zu (total=%zu)\n",
-           io.out_buf_sz, io.inL_buf_sz, io.inR_buf_sz, io.part_buf_sz, io.total_bytes);
+           io.out_buf_sz, io.inL_buf_sz, io.inR_buf_sz,
+           io.part_buf_sz, io.total_bytes);
 
+    /* === 3. I/O 버퍼 / 파티션 파일 정보 big_alloc === */
+    char *out_iobuf = (char*)big_alloc(io.out_buf_sz);
+    char *inL_iobuf = (char*)big_alloc(io.inL_buf_sz);
+    char *inR_iobuf = (char*)big_alloc(io.inR_buf_sz);
+
+    char (*left_part_paths)[PART_PATH_LEN] =
+        (char(*)[PART_PATH_LEN])big_alloc((size_t)P * (size_t)PART_PATH_LEN);
+    char (*right_part_paths)[PART_PATH_LEN] =
+        (char(*)[PART_PATH_LEN])big_alloc((size_t)P * (size_t)PART_PATH_LEN);
+
+    FILE **lfp = (FILE**)big_alloc(sizeof(FILE*) * (size_t)P);
+    FILE **rfp = (FILE**)big_alloc(sizeof(FILE*) * (size_t)P);
+
+    size_t *left_part_rec_counts  = (size_t*)big_alloc(sizeof(size_t) * (size_t)P);
+    size_t *right_part_rec_counts = (size_t*)big_alloc(sizeof(size_t) * (size_t)P);
+
+    memset(left_part_rec_counts,  0, sizeof(size_t) * (size_t)P);
+    memset(right_part_rec_counts, 0, sizeof(size_t) * (size_t)P);
+
+    /* 파티션 파일용 버퍼 풀: (left,right) * P 개 */
+    char *part_iobuf_pool = NULL;
+    if (io.part_buf_sz > 0) {
+        part_iobuf_pool =
+            (char*)big_alloc(io.part_buf_sz * (size_t)(2 * P));
+    }
+
+    /* === 4. 입력 파일 오픈 및 버퍼 설정 === */
+    FILE *lf = fopen(left->path, "r");
+    if (!lf) {
+        perror("fopen left");
+        exit(EXIT_FAILURE);
+    }
+    FILE *rf = fopen(right->path, "r");
+    if (!rf) {
+        perror("fopen right");
+        exit(EXIT_FAILURE);
+    }
+
+    if (inL_iobuf && io.inL_buf_sz)
+        setvbuf(lf, inL_iobuf, _IOFBF, io.inL_buf_sz);
+    if (inR_iobuf && io.inR_buf_sz)
+        setvbuf(rf, inR_iobuf, _IOFBF, io.inR_buf_sz);
+
+    /* 파티션 파일 생성 */
     for (unsigned int p = 0; p < P; p++) {
         snprintf(left_part_paths[p],  PART_PATH_LEN, "left_part_%u.tmp",  p);
         snprintf(right_part_paths[p], PART_PATH_LEN, "right_part_%u.tmp", p);
 
         lfp[p] = fopen(left_part_paths[p], "w+");
-        if (!lfp[p]) { perror("fopen left partition"); exit(EXIT_FAILURE); }
+        if (!lfp[p]) {
+            perror("fopen left partition");
+            exit(EXIT_FAILURE);
+        }
         rfp[p] = fopen(right_part_paths[p], "w+");
-        if (!rfp[p]) { perror("fopen right partition"); exit(EXIT_FAILURE); }
+        if (!rfp[p]) {
+            perror("fopen right partition");
+            exit(EXIT_FAILURE);
+        }
 
         if (part_iobuf_pool && io.part_buf_sz) {
             char *bufL = part_iobuf_pool + (size_t)(2 * p) * io.part_buf_sz;
@@ -297,94 +331,97 @@ void left_join_strategyB(const Table *left,
         }
     }
 
-    /* Phase 1: partitioning */
-    int left_blocks_p1 = 0, right_blocks_p1 = 0;
-    size_t left_recs_p1 = 0, right_recs_p1 = 0;
+    /* === 5. Phase1: partitioning === */
+    int left_blocks_p1  = 0;
+    int right_blocks_p1 = 0;
+    size_t left_recs_p1 = 0;
+    size_t right_recs_p1= 0;
 
-    {
-        FILE *lf = fopen(left->filename, "r");
-        if (!lf) { perror("fopen left"); exit(EXIT_FAILURE); }
-        if (inL_iobuf) setvbuf(lf, inL_iobuf, _IOFBF, io.inL_buf_sz);
+    PendingLine pend = {0};
 
-        PendingLine pend = {0};
-        while (1) {
-            int cnt = 0;
-            struct timespec tr1, tr2;
-            clock_gettime(CLOCK_MONOTONIC, &tr1);
-            int ok = fill_block(lf, B_L, blkL, recsL, &cnt, &pend, max_left_recs);
-            clock_gettime(CLOCK_MONOTONIC, &tr2);
-            g_time_read += diff_sec(&tr1, &tr2);
-            if (!ok || cnt == 0) break;
+    /* left partition */
+    while (1) {
+        int lc = 0;
+        struct timespec tr1, tr2;
+        clock_gettime(CLOCK_MONOTONIC, &tr1);
+        int ok = fill_block(lf, B_L, blkL, recsL, &lc, &pend, max_left_recs);
+        clock_gettime(CLOCK_MONOTONIC, &tr2);
+        g_time_read += diff_sec(&tr1, &tr2);
 
-            left_blocks_p1++;
-            for (int i = 0; i < cnt; i++) {
-                char key[256];
-                get_field(recsL[i], left->header.key_index, key, sizeof(key));
-                unsigned int part = (unsigned int)(hash_string(key) % P);
+        if (!ok || lc == 0) break;
+        left_blocks_p1++;
 
-                struct timespec tw1, tw2;
-                clock_gettime(CLOCK_MONOTONIC, &tw1);
-                fputs(recsL[i], lfp[part]);
-                fputc('\n', lfp[part]);
-                clock_gettime(CLOCK_MONOTONIC, &tw2);
-                g_time_write += diff_sec(&tw1, &tw2);
+        for (int i = 0; i < lc; i++) {
+            char key_buf[256];
+            get_field(recsL[i], left->header.key_index, key_buf, sizeof(key_buf));
 
-                left_part_rec_counts[part]++;
-                left_recs_p1++;
-            }
+            uint64_t h = hash_string(key_buf);
+            unsigned int part = (unsigned int)(h % P);
+
+            struct timespec tw1, tw2;
+            clock_gettime(CLOCK_MONOTONIC, &tw1);
+            fputs(recsL[i], lfp[part]);
+            fputc('\n', lfp[part]);
+            clock_gettime(CLOCK_MONOTONIC, &tw2);
+            g_time_write += diff_sec(&tw1, &tw2);
+
+            left_part_rec_counts[part]++;
+            left_recs_p1++;
         }
-        pendingline_reset_local(&pend);
-        fclose(lf);
     }
-
-    {
-        FILE *rf = fopen(right->filename, "r");
-        if (!rf) { perror("fopen right"); exit(EXIT_FAILURE); }
-        if (inR_iobuf) setvbuf(rf, inR_iobuf, _IOFBF, io.inR_buf_sz);
-
-        PendingLine pend = {0};
-        while (1) {
-            int cnt = 0;
-            struct timespec tr1, tr2;
-            clock_gettime(CLOCK_MONOTONIC, &tr1);
-            int ok = fill_block(rf, B_R, blkR, recsR, &cnt, &pend, max_right_recs);
-            clock_gettime(CLOCK_MONOTONIC, &tr2);
-            g_time_read += diff_sec(&tr1, &tr2);
-            if (!ok || cnt == 0) break;
-
-            right_blocks_p1++;
-            for (int i = 0; i < cnt; i++) {
-                char key[256];
-                get_field(recsR[i], right->header.key_index, key, sizeof(key));
-                unsigned int part = (unsigned int)(hash_string(key) % P);
-
-                struct timespec tw1, tw2;
-                clock_gettime(CLOCK_MONOTONIC, &tw1);
-                fputs(recsR[i], rfp[part]);
-                fputc('\n', rfp[part]);
-                clock_gettime(CLOCK_MONOTONIC, &tw2);
-                g_time_write += diff_sec(&tw1, &tw2);
-
-                right_part_rec_counts[part]++;
-                right_recs_p1++;
-            }
-        }
-        pendingline_reset_local(&pend);
-        fclose(rf);
-    }
+    pendingline_reset_local(&pend);
 
     for (unsigned int p = 0; p < P; p++) {
-        fflush(lfp[p]); fflush(rfp[p]);
+        fflush(lfp[p]);
         fseek(lfp[p], 0, SEEK_SET);
+    }
+    fclose(lf);
+
+    /* right partition */
+    pend.pending_len = 0;
+    while (1) {
+        int rc = 0;
+        struct timespec tr1, tr2;
+        clock_gettime(CLOCK_MONOTONIC, &tr1);
+        int ok = fill_block(rf, B_R, blkR, recsR, &rc, &pend, max_right_recs);
+        clock_gettime(CLOCK_MONOTONIC, &tr2);
+        g_time_read += diff_sec(&tr1, &tr2);
+
+        if (!ok || rc == 0) break;
+        right_blocks_p1++;
+
+        for (int i = 0; i < rc; i++) {
+            char key_buf[256];
+            get_field(recsR[i], right->header.key_index, key_buf, sizeof(key_buf));
+
+            uint64_t h = hash_string(key_buf);
+            unsigned int part = (unsigned int)(h % P);
+
+            struct timespec tw1, tw2;
+            clock_gettime(CLOCK_MONOTONIC, &tw1);
+            fputs(recsR[i], rfp[part]);
+            fputc('\n', rfp[part]);
+            clock_gettime(CLOCK_MONOTONIC, &tw2);
+            g_time_write += diff_sec(&tw1, &tw2);
+
+            right_part_rec_counts[part]++;
+            right_recs_p1++;
+        }
+    }
+    pendingline_reset_local(&pend);
+    fclose(rf);
+
+    for (unsigned int p = 0; p < P; p++) {
+        fflush(rfp[p]);
         fseek(rfp[p], 0, SEEK_SET);
     }
 
-    size_t nonemptyR = 0, nonemptyL = 0, maxR = 0, maxL = 0;
+    size_t nonemptyL = 0, nonemptyR = 0, maxL = 0, maxR = 0;
     for (unsigned int p = 0; p < P; p++) {
-        if (right_part_rec_counts[p]) nonemptyR++;
         if (left_part_rec_counts[p])  nonemptyL++;
-        if (right_part_rec_counts[p] > maxR) maxR = right_part_rec_counts[p];
+        if (right_part_rec_counts[p]) nonemptyR++;
         if (left_part_rec_counts[p]  > maxL) maxL = left_part_rec_counts[p];
+        if (right_part_rec_counts[p] > maxR) maxR = right_part_rec_counts[p];
     }
 
     printf("[INFO] Phase1 done: left_blocks=%d right_blocks=%d left_recs=%zu right_recs=%zu\n",
@@ -392,24 +429,33 @@ void left_join_strategyB(const Table *left,
     printf("[INFO] Partition dist: nonemptyL=%zu/%u (maxL=%zu), nonemptyR=%zu/%u (maxR=%zu)\n",
            nonemptyL, P, maxL, nonemptyR, P, maxR);
 
-    /* Phase 2: per-part join */
-    FILE *out = fopen(output_path, "w");
-    if (!out) { perror("fopen output"); exit(EXIT_FAILURE); }
-    if (out_iobuf) setvbuf(out, out_iobuf, _IOFBF, io.out_buf_sz);
-
+    /* === 6. Phase2: 파티션별 조인 (메모리는 기존 방식, probe만 OMP 병렬) === */
     const int nonkey_cnt = right->header.num_columns - 1;
-    int left_blocks_p2 = 0, right_blocks_p2 = 0;
+    int left_blocks_p2  = 0;
+    int right_blocks_p2 = 0;
+
+    FILE *out = fopen(output_path, "w");
+    if (!out) {
+        perror("fopen output");
+        exit(EXIT_FAILURE);
+    }
+    if (out_iobuf && io.out_buf_sz)
+        setvbuf(out, out_iobuf, _IOFBF, io.out_buf_sz);
+
     size_t printed = 0;
 
     for (unsigned int p = 0; p < P; p++) {
         fseek(lfp[p], 0, SEEK_SET);
         fseek(rfp[p], 0, SEEK_SET);
 
-        if (left_part_rec_counts[p] == 0) continue;
-
+        if (left_part_rec_counts[p] == 0) {
+            continue;
+        }
         if (right_part_rec_counts[p] == 0) {
+            /* 오른쪽 파티션이 비었으면, 왼쪽만 NULL로 채워서 출력 */
             PendingLine pendL = {0};
             int localLBlocks = 0;
+
             while (1) {
                 int lc = 0;
                 struct timespec tr1, tr2;
@@ -435,26 +481,34 @@ void left_join_strategyB(const Table *left,
             left_blocks_p2 += localLBlocks;
 
             if (printed < 6) {
-                printf("[INFO] part=%u/%u: R=0 -> emit NULLs (Lrecs=%zu)\n", p + 1, P, left_part_rec_counts[p]);
+                printf("[INFO] part=%u/%u: R=0 -> emit NULLs (Lrecs=%zu)\n",
+                       p + 1, P, left_part_rec_counts[p]);
                 printed++;
             }
             continue;
         }
 
+        /* 해시테이블 새로 구축 */
         arena_reset(&arena);
 
         size_t rN = right_part_rec_counts[p];
-        size_t bucket_count = next_pow2(rN * 2);
+
+        /* bucket_count: load factor ~ 1.0 (strict mem에서 버킷 오버헤드 줄이기) */
+        size_t bucket_count = next_pow2(rN);
         if (bucket_count < 1024) bucket_count = 1024;
 
-        size_t max_bucket_bytes = (arena_cap > 0) ? (arena_cap / 4) : 0;
-        while (bucket_count * sizeof(HashNode*) > max_bucket_bytes && bucket_count > 1024) {
-            bucket_count >>= 1;
+        /* 버킷이 arena를 너무 많이 먹지 않도록 상한(12.5%) */
+        size_t max_bucket_bytes = (arena_cap > 0) ? (arena_cap / 8) : 0;
+        if (max_bucket_bytes > 0) {
+            while (bucket_count * sizeof(HashNode*) > max_bucket_bytes && bucket_count > 1024) {
+                bucket_count >>= 1;
+            }
         }
-
-        HashNode **buckets = (HashNode**)arena_calloc_local(&arena, bucket_count, sizeof(HashNode*));
+        HashNode **buckets = (HashNode**)arena_calloc(&arena, bucket_count, sizeof(HashNode*));
         if (!buckets) {
-            fprintf(stderr, "[ERROR] arena too small for buckets: part=%u bucket_count=%zu\n", p, bucket_count);
+            fprintf(stderr,
+                    "[ERROR] arena too small for buckets: part=%u bucket_count=%zu cap=%zu\n",
+                    p, bucket_count, arena_cap);
             exit(EXIT_FAILURE);
         }
 
@@ -484,14 +538,18 @@ void left_join_strategyB(const Table *left,
 
                 HashNode *node = (HashNode*)arena_alloc(&arena, sizeof(HashNode));
                 if (!node) {
-                    fprintf(stderr, "[ERROR] arena overflow building hash (part=%u). Increase P/max_mem.\n", p);
+                    fprintf(stderr,
+                            "[ERROR] arena overflow building hash (part=%u). Increase P/max_mem.\n",
+                            p);
                     exit(EXIT_FAILURE);
                 }
                 node->h      = h;
                 node->key    = arena_strdup(&arena, key_buf);
                 node->nonkey = arena_strdup(&arena, nonkey_buf);
                 if (!node->key || !node->nonkey) {
-                    fprintf(stderr, "[ERROR] arena overflow on strdup (part=%u). Increase P/max_mem.\n", p);
+                    fprintf(stderr,
+                            "[ERROR] arena overflow on strdup (part=%u). Increase P/max_mem.\n",
+                            p);
                     exit(EXIT_FAILURE);
                 }
                 node->next   = buckets[idx];
@@ -500,7 +558,7 @@ void left_join_strategyB(const Table *left,
         }
         pendingline_reset_local(&pendR);
 
-        /* probe with left partition */
+        /* probe with left partition (레코드 루프만 OpenMP 병렬) */
         PendingLine pendL = {0};
         int localLBlocks = 0;
         while (1) {
@@ -514,6 +572,10 @@ void left_join_strategyB(const Table *left,
             if (!ok || lc == 0) break;
             localLBlocks++;
 
+            /* ==== probe left block with OpenMP over records ==== */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (int i = 0; i < lc; i++) {
                 char key_buf[256];
                 get_field(recsL[i], left->header.key_index, key_buf, sizeof(key_buf));
@@ -527,22 +589,38 @@ void left_join_strategyB(const Table *left,
                         matched = 1;
                         struct timespec tw1, tw2;
                         clock_gettime(CLOCK_MONOTONIC, &tw1);
-                        fputs(recsL[i], out);
-                        fputs(n->nonkey, out);
-                        fputc('\n', out);
-                        clock_gettime(CLOCK_MONOTONIC, &tw2);
-                        g_time_write += diff_sec(&tw1, &tw2);
+                        /* 출력은 파일 공유 자원이라 임계영역에서 처리 */
+                    #pragma omp critical(join_out_write)
+                        {
+                            struct timespec tw1, tw2;
+                            clock_gettime(CLOCK_MONOTONIC, &tw1);
+
+                            fputs(recsL[i], out);
+                            fputs(n->nonkey, out);
+                            fputc('\n', out);
+
+                            clock_gettime(CLOCK_MONOTONIC, &tw2);
+                            g_time_write += diff_sec(&tw1, &tw2);
+                        }
                     }
                 }
 
                 if (!matched) {
                     struct timespec tw1, tw2;
                     clock_gettime(CLOCK_MONOTONIC, &tw1);
+                #pragma omp critical(join_out_write)
+                {
+                    struct timespec tw1, tw2;
+                    clock_gettime(CLOCK_MONOTONIC, &tw1);
+
                     fputs(recsL[i], out);
                     for (int k = 0; k < nonkey_cnt; k++) fputs("NULL|", out);
                     fputc('\n', out);
+
                     clock_gettime(CLOCK_MONOTONIC, &tw2);
                     g_time_write += diff_sec(&tw1, &tw2);
+                }
+
                 }
             }
         }
@@ -551,9 +629,10 @@ void left_join_strategyB(const Table *left,
         left_blocks_p2  += localLBlocks;
         right_blocks_p2 += localRBlocks;
 
-        if (printed < 10 || ((p + 1) % 32 == 0) || (p + 1 == P)) {
+        if (printed < 10 || ((p + 1) % 16 == 0) || (p + 1 == P)) {
             printf("[INFO] part=%u/%u: Lrecs=%zu Rrecs=%zu buckets=%zu Lblocks=%d Rblocks=%d\n",
-                   p + 1, P, left_part_rec_counts[p], right_part_rec_counts[p],
+                   p + 1, P,
+                   left_part_rec_counts[p], right_part_rec_counts[p],
                    bucket_count, localLBlocks, localRBlocks);
             printed++;
         }
@@ -561,6 +640,7 @@ void left_join_strategyB(const Table *left,
 
     fclose(out);
 
+    /* partition 파일 정리 */
     for (unsigned int p = 0; p < P; p++) {
         if (lfp[p]) fclose(lfp[p]);
         if (rfp[p]) fclose(rfp[p]);
@@ -568,10 +648,14 @@ void left_join_strategyB(const Table *left,
         remove(right_part_paths[p]);
     }
 
-    printf("[INFO] Phase2 done: left_blocks=%d right_blocks=%d\n", left_blocks_p2, right_blocks_p2);
+    printf("[INFO] Phase2 done: left_blocks=%d right_blocks=%d\n",
+           left_blocks_p2, right_blocks_p2);
+
     printf("[INFO] SUMMARY: P=%u, phase1(L=%d R=%d), phase2(L=%d R=%d), total(L=%d R=%d)\n",
-           P, left_blocks_p1, right_blocks_p1, left_blocks_p2, right_blocks_p2,
-           left_blocks_p1 + left_blocks_p2, right_blocks_p1 + right_blocks_p2);
+           P, left_blocks_p1, right_blocks_p1,
+           left_blocks_p2, right_blocks_p2,
+           left_blocks_p1 + left_blocks_p2,
+           right_blocks_p1 + right_blocks_p2);
 
     clock_gettime(CLOCK_MONOTONIC, &tj_end);
     double total = diff_sec(&tj_start, &tj_end);
