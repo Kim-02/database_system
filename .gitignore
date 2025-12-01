@@ -7,3 +7,4 @@ part.tbl
 partsupp.tbl
 .sh
 .log
+*.tbl
