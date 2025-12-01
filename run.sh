@@ -3,11 +3,11 @@ set -euo pipefail
 
 RUNS=1
 
-LEFT_FILE="part.tbl"
-LEFT_SCHEMA="partkey,name,mfgr,brand,type,size,container,retailprice,comment"
-RIGHT_FILE="partsupp.tbl"
-RIGHT_SCHEMA="partkey,suppkey,availqty,supplycost,comment"
-KEY="partkey"
+LEFT_FILE="lineitem.tbl"
+LEFT_SCHEMA="orderkey,partkey,suppkey,linenumber,quantity,extendedprice,discount,tax,returnflag,linestatus,shipdate,commitdate,receiptdate,shipinstruct,shipmode,comment"
+RIGHT_FILE="orders.tbl"
+RIGHT_SCHEMA="orderkey,custkey,orderstatus,totalprice,orderdate,orderpriority,clerk,shippriority,comment"
+KEY="orderkey"
 
 ORIG_DIR="$(pwd)"
 
@@ -107,12 +107,104 @@ avg_tc() {
 }
 
 # ---- 실행할 블록 (TC별 MM 지정) ----
-avg_tc "MS1" 32  8192  8192
-avg_tc "MS2" 64  8192  8192
-avg_tc "MS3" 128  8192  8192
-avg_tc "MS4" 256  8192  8192
-avg_tc "MS5" 512  8192  8192
+avg_tc "M2_B1024" 2 1024 1024
+avg_tc "M2_B2048" 2 2048 2048
+avg_tc "M2_B4096" 2 4096 4096
+avg_tc "M2_B8192" 2 8192 8192
+avg_tc "M2_B16384" 2 16384 16384
 
-# 예시: TC별로 MM 바꾸려면 이렇게 추가
-# avg_tc "M1" 128 4096 4096
-# avg_tc "M2" 512 4096 4096
+avg_tc "M4_B1024" 4 1024 1024
+avg_tc "M4_B2048" 4 2048 2048
+avg_tc "M4_B4096" 4 4096 4096
+avg_tc "M4_B8192" 4 8192 8192
+avg_tc "M4_B16384" 4 16384 16384
+
+avg_tc "M8_B1024" 8 1024 1024
+avg_tc "M8_B2048" 8 2048 2048
+avg_tc "M8_B4096" 8 4096 4096
+avg_tc "M8_B8192" 8 8192 8192
+avg_tc "M8_B16384" 8 16384 16384
+
+avg_tc "M16_B1024" 16 1024 1024
+avg_tc "M16_B2048" 16 2048 2048
+avg_tc "M16_B4096" 16 4096 4096
+avg_tc "M16_B8192" 16 8192 8192
+avg_tc "M16_B16384" 16 16384 16384
+
+avg_tc "M32_B1024" 32 1024 1024
+avg_tc "M32_B2048" 32 2048 2048
+avg_tc "M32_B4096" 32 4096 4096
+avg_tc "M32_B8192" 32 8192 8192
+avg_tc "M32_B16384" 32 16384 16384
+
+avg_tc "M64_B1024" 64 1024 1024
+avg_tc "M64_B2048" 64 2048 2048
+avg_tc "M64_B4096" 64 4096 4096
+avg_tc "M64_B8192" 64 8192 8192
+avg_tc "M64_B16384" 64 16384 16384
+
+avg_tc "M128_B1024" 128 1024 1024
+avg_tc "M128_B2048" 128 2048 2048
+avg_tc "M128_B4096" 128 4096 4096
+avg_tc "M128_B8192" 128 8192 8192
+avg_tc "M128_B16384" 128 16384 16384
+
+avg_tc "M256_B1024" 256 1024 1024
+avg_tc "M256_B2048" 256 2048 2048
+avg_tc "M256_B4096" 256 4096 4096
+avg_tc "M256_B8192" 256 8192 8192
+avg_tc "M256_B16384" 256 16384 16384
+
+avg_tc "M512_B1024" 512 1024 1024
+avg_tc "M512_B2048" 512 2048 2048
+avg_tc "M512_B4096" 512 4096 4096
+avg_tc "M512_B8192" 512 8192 8192
+avg_tc "M512_B16384" 512 16384 16384
+
+# MM in {128,256}
+# Case A: Left fixed (4096 or 8192), Right varies (1024..16384)
+avg_tc "M128_L4096_R1024" 128 4096 1024
+avg_tc "M128_L4096_R2048" 128 4096 2048
+avg_tc "M128_L4096_R4096" 128 4096 4096
+avg_tc "M128_L4096_R8192" 128 4096 8192
+avg_tc "M128_L4096_R16384" 128 4096 16384
+avg_tc "M128_L8192_R1024" 128 8192 1024
+avg_tc "M128_L8192_R2048" 128 8192 2048
+avg_tc "M128_L8192_R4096" 128 8192 4096
+avg_tc "M128_L8192_R8192" 128 8192 8192
+avg_tc "M128_L8192_R16384" 128 8192 16384
+
+avg_tc "M256_L4096_R1024" 256 4096 1024
+avg_tc "M256_L4096_R2048" 256 4096 2048
+avg_tc "M256_L4096_R4096" 256 4096 4096
+avg_tc "M256_L4096_R8192" 256 4096 8192
+avg_tc "M256_L4096_R16384" 256 4096 16384
+avg_tc "M256_L8192_R1024" 256 8192 1024
+avg_tc "M256_L8192_R2048" 256 8192 2048
+avg_tc "M256_L8192_R4096" 256 8192 4096
+avg_tc "M256_L8192_R8192" 256 8192 8192
+avg_tc "M256_L8192_R16384" 256 8192 16384
+
+
+# Case B: Right fixed (4096 or 8192), Left varies (1024..16384)
+avg_tc "M128_L1024_R4096" 128 1024 4096
+avg_tc "M128_L2048_R4096" 128 2048 4096
+avg_tc "M128_L4096_R4096" 128 4096 4096
+avg_tc "M128_L8192_R4096" 128 8192 4096
+avg_tc "M128_L16384_R4096" 128 16384 4096
+avg_tc "M128_L1024_R8192" 128 1024 8192
+avg_tc "M128_L2048_R8192" 128 2048 8192
+avg_tc "M128_L4096_R8192" 128 4096 8192
+avg_tc "M128_L8192_R8192" 128 8192 8192
+avg_tc "M128_L16384_R8192" 128 16384 8192
+
+avg_tc "M256_L1024_R4096" 256 1024 4096
+avg_tc "M256_L2048_R4096" 256 2048 4096
+avg_tc "M256_L4096_R4096" 256 4096 4096
+avg_tc "M256_L8192_R4096" 256 8192 4096
+avg_tc "M256_L16384_R4096" 256 16384 4096
+avg_tc "M256_L1024_R8192" 256 1024 8192
+avg_tc "M256_L2048_R8192" 256 2048 8192
+avg_tc "M256_L4096_R8192" 256 4096 8192
+avg_tc "M256_L8192_R8192" 256 8192 8192
+avg_tc "M256_L16384_R8192" 256 16384 8192
