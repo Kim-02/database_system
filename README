@@ -36,5 +36,5 @@ part.tbl, partsupp.tbl 파일 TPC에서 가져와서 사용하면 됨
 ---------
 omp 사용방법
 make clean - make OMP=1
-OMP_NUM_THREADS=4 ./main.out 128 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 16384 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 16384 partkey
+OMP_NUM_THREADS=4 ./main.out 512 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 4096 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 4096 partkey
 OMP_NUM_THREADS=4 ./main.out 512 lineitem.tbl "orderkey,partkey,suppkey,linenumber,quantity,extendedprice,discount,tax,returnflag,linestatus,shipdate,commitdate,receiptdate,shipinstruct,shipmode,comment" 9180 orders.tbl   "orderkey,custkey,orderstatus,totalprice,orderdate,orderpriority,clerk,shippriority,comment" 9180 orderkey

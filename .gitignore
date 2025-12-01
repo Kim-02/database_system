@@ -5,6 +5,7 @@ main.out
 join.txt
 part.tbl
 partsupp.tbl
+*.tbl
 .sh
-.log
+*.log
 .tmp
