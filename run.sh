@@ -1,14 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-RUNS=3
-OMP_THREADS=4
+RUNS=1
 
-LEFT_FILE="part.tbl"
-LEFT_SCHEMA="partkey,name,mfgr,brand,type,size,container,retailprice,comment"
-RIGHT_FILE="partsupp.tbl"
-RIGHT_SCHEMA="partkey,suppkey,availqty,supplycost,comment"
-KEY="partkey"
+LEFT_FILE="lineitem.tbl"
+LEFT_SCHEMA="orderkey,partkey,suppkey,linenumber,quantity,extendedprice,discount,tax,returnflag,linestatus,shipdate,commitdate,receiptdate,shipinstruct,shipmode,comment"
+RIGHT_FILE="orders.tbl"
+RIGHT_SCHEMA="orderkey,custkey,orderstatus,totalprice,orderdate,orderpriority,clerk,shippriority,comment"
+KEY="orderkey"
 
 ORIG_DIR="$(pwd)"
 
@@ -37,14 +36,14 @@ drop_caches() {
 }
 
 run_one() {
-  local tc="$1" run_idx="$2" mm="$3" bl="$4" br="$5"
+  local tc="$1" run_idx="$2" omp="$3" mm="$4" bl="$5" br="$6"
   local workdir
-  workdir="$(mktemp -d -p "$SCRATCH_ROOT" "${tc}_run${run_idx}_XXXXXX")"
+  workdir="$(mktemp -d -p "$SCRATCH_ROOT" "${tc}_omp${omp}_run${run_idx}_XXXXXX")"
 
   (
     cd "$workdir"
     export TMPDIR="$workdir"
-    export OMP_NUM_THREADS="$OMP_THREADS"
+    export OMP_NUM_THREADS="$omp"
     export OMP_PROC_BIND=true
     export OMP_PLACES=cores
 
@@ -66,20 +65,21 @@ extract_metric() {
     }'
 }
 
+# avg_tc "TC" OMP MM B_L B_R
 avg_tc() {
-  local tc="$1" mm="$2" bl="$3" br="$4"
+  local tc="$1" omp="$2" mm="$3" bl="$4" br="$5"
 
-  local log="$ORIG_DIR/AR3log_${tc}_OMP${OMP_THREADS}_MM${mm}.log"
-  local results="$ORIG_DIR/results_omp${OMP_THREADS}.tsv"
+  local log="$ORIG_DIR/AR3log_${tc}_OMP${omp}_MM${mm}_BL${bl}_BR${br}.log"
+  local results="$ORIG_DIR/results_omp.tsv"
 
   local sum_elapsed=0 sum_read=0 sum_join=0 sum_write=0
   local last_out=""
 
   for i in $(seq 1 "$RUNS"); do
-    echo "==== $tc RUN $i (OMP=$OMP_THREADS MM=$mm B_L=$bl B_R=$br) ====" | tee -a "$log"
+    echo "==== $tc RUN $i (OMP=$omp MM=$mm B_L=$bl B_R=$br) ====" | tee -a "$log"
     drop_caches
 
-    last_out="$(run_one "$tc" "$i" "$mm" "$bl" "$br")"
+    last_out="$(run_one "$tc" "$i" "$omp" "$mm" "$bl" "$br")"
     echo "$last_out" | tee -a "$log"
 
     local elapsed read_t join_t write_t
@@ -107,25 +107,68 @@ avg_tc() {
   fi
 
   printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n" \
-    "$tc" "$OMP_THREADS" "$mm" "$bl" "$br" "$avg_elapsed" "$avg_read" "$avg_join" "$avg_write" | tee -a "$results"
+    "$tc" "$omp" "$mm" "$bl" "$br" "$avg_elapsed" "$avg_read" "$avg_join" "$avg_write" | tee -a "$results"
 }
 
-# ---- 실행할 블록 (TC별 MM 지정) ----
-avg_tc "S1"	256	1024	1024	
-avg_tc "S2"	256	2048	2048	
-avg_tc "S3"	256	4096	4096	
-avg_tc "S4"	256	8192	8192	
-avg_tc "S5"	256	16384	16384	
-avg_tc "S6"	256	32768	32768	
+# --------------------------
+# 실행할 블록
+# 128에서는 OMP=2만
+# 256에서는 OMP=2,4
+# --------------------------
 
-avg_tc "R1"	256	4096	1024	
-avg_tc "R2"	256	4096	2048	
-avg_tc "R3"	256	4096	4096	
-avg_tc "R4"	256	4096	8192	
-avg_tc "R5"	256	4096	16384
+# # ===== MM=128, OMP=2 =====
+# avg_tc "S1" 2 128 1024 1024
+# avg_tc "S2" 2 128 2048 2048
+# avg_tc "S3" 2 128 4096 4096
+# avg_tc "S4" 2 128 8192 8192
+# avg_tc "S5" 2 128 16384 16384
 
-avg_tc "L1"	256	1024	4096	
-avg_tc "L2"	256	2048	4096	
-avg_tc "L3"	256	4096	4096	
-avg_tc "L4"	256	8192	4096	
-avg_tc "L5"	256	16384	4096
+# avg_tc "R1" 2 128 4096 1024
+# avg_tc "R2" 2 128 4096 2048
+# avg_tc "R3" 2 128 4096 4096
+# avg_tc "R4" 2 128 4096 8192
+# avg_tc "R5" 2 128 4096 16384
+
+# avg_tc "L1" 2 128 1024 4096
+# avg_tc "L2" 2 128 2048 4096
+# avg_tc "L3" 2 128 4096 4096
+# avg_tc "L4" 2 128 8192 4096
+# avg_tc "L5" 2 128 16384 4096
+
+# # ===== MM=256, OMP=2 =====
+# avg_tc "S1" 2 256 1024 1024
+# avg_tc "S2" 2 256 2048 2048
+# avg_tc "S3" 2 256 4096 4096
+# avg_tc "S4" 2 256 8192 8192
+# avg_tc "S5" 2 256 16384 16384
+
+# avg_tc "R1" 2 256 4096 1024
+# avg_tc "R2" 2 256 4096 2048
+# avg_tc "R3" 2 256 4096 4096
+# avg_tc "R4" 2 256 4096 8192
+# avg_tc "R5" 2 256 4096 16384
+
+# avg_tc "L1" 2 256 1024 4096
+# avg_tc "L2" 2 256 2048 4096
+# avg_tc "L3" 2 256 4096 4096
+# avg_tc "L4" 2 256 8192 4096
+avg_tc "L5" 2 256 16384 4096
+
+# ===== MM=256, OMP=4 =====
+avg_tc "S1" 4 256 1024 1024
+avg_tc "S2" 4 256 2048 2048
+avg_tc "S3" 4 256 4096 4096
+avg_tc "S4" 4 256 8192 8192
+avg_tc "S5" 4 256 16384 16384
+
+avg_tc "R1" 4 256 4096 1024
+avg_tc "R2" 4 256 4096 2048
+avg_tc "R3" 4 256 4096 4096
+avg_tc "R4" 4 256 4096 8192
+avg_tc "R5" 4 256 4096 16384
+
+avg_tc "L1" 4 256 1024 4096
+avg_tc "L2" 4 256 2048 4096
+avg_tc "L3" 4 256 4096 4096
+avg_tc "L4" 4 256 8192 4096
+avg_tc "L5" 4 256 16384 4096
