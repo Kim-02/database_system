@@ -1,33 +1,66 @@
-mmap_read.h는 mmap을 이용하여 입력 파일을 메모리에 매핑한다.
-이는 fread/fgets처럼 사용자 버퍼에 반복적으로 읽어들이는 방식보다
-시스템콜 오버헤드가 적고 페이지 캐시를 그대로 활용할 수 있어 더 빠르게 동작한다.
+테스트 방법
+run.sh 파일
+LEFT_FILE= //왼쪽 비교 파일
+LEFT_SCHEMA= //왼쪽 메타데이터
+RIGHT_FILE= //오른쪽 비교 파일
+RIGHT_SCHEMA= //오른쪽 메타데이터
+KEY= //비교키
+원하는 대로 설정한다.
 
-실험에서는 비신장 가변길이 블로킹을 사용하기 때문에
-레코드가 블록 경계를 넘어가면 안 된다. 
-따라서 각 블록은 [header + data] 구조로 이루어지며
-header에서 남은 공간을 관리하여 레코드 삽입 여부를 결정한다.
+for mm in 128 256 512 1024; do
+  avg_tc "M${mm}_L4096_R1024"  "$mm" 4096 1024
+  avg_tc "M${mm}_L4096_R2048"  "$mm" 4096 2048
+  avg_tc "M${mm}_L4096_R4096"  "$mm" 4096 4096
+  avg_tc "M${mm}_L4096_R8192"  "$mm" 4096 8192
+  avg_tc "M${mm}_L4096_R16384" "$mm" 4096 16384
 
-블록이 가득 차서 flush가 일어나는 횟수는 
-DBMS에서 페이지 I/O가 발생하는 횟수와 동일한 의미를 가진다.
-블록 크기가 작으면 flush 횟수가 증가하여 페이지 생성 및 디스크 접근 오버헤드가 증가하고,
-블록 크기를 키우면 flush 횟수가 줄어들어 I/O 성능이 향상된다.
+done
+이 부분을 원하는 테스트 케이스로 바꿔준다.
+avg_tc "테스트명" 왼쪽블록크기 오른쪽블록크기
+터미널에 make를 한 후
+sudo ./run.sh
+이렇게 하면 테스트 케이스 수 만큼 돌게 된다.
 
-실험 결과에서도 PageSize를 2048에서 4096으로 늘리자
-flush 횟수가 약 절반으로 감소하였고,
-전체 처리 속도는 15~20% 향상되는 것을 확인할 수 있었다.
-캐시 효과 때문에 개별 실행 결과는 편차가 있으므로
-여러 번 반복 측정하여 평균값을 사용하는 것이 필수적이다.
+작동 순서
 
-11/17 수정 
-mmap을 사용하지 않고 read방식을 사용 -> 이게 더 메모리 친화적으로 접근하는 방식이고 IO 시간 차이도 더
-잘 나오는 방법임
-table_split 헤더를 추가했음 -> difine에 정의된 페이지 사이즈별로 블록을 하나의 파일에 써주는 것
-나중에 읽을 때는 나눈 페이지 사이즈를 기준으로 fseek하면 됨
+main.c에서 프로그램을 시작하고 인자(argv)를 파싱한 뒤 전체 메모리 한도(g_max_memory_bytes)를 설정한다.
 
-11/20 수정
-main에 일단 모든 코드 몰아넣었음 -> 모듈화 예정
-사용 코드
+main.c에서 왼쪽(LEFT) 테이블과 오른쪽(RIGHT) 테이블에 대해 table_init()을 호출한다.
 
-./main.out 메모리제한(MB) 파일명 메타데이터 파일블록크기 ... 조인키
-./main.out 128 part.tbl "partkey,name,mfgr,brand,type,size,container,retailprice,comment" 16384 partsupp.tbl "partkey,suppkey,availqty,supplycost,comment" 16384 partkey
-part.tbl, partsupp.tbl 파일 TPC에서 가져와서 사용하면 됨
+table.c의 table_init()이 입력 파일의 헤더를 파싱하고, 조인 키 컬럼의 인덱스(key_index)를 찾고, 블록 크기(block_size) 같은 테이블 메타데이터를 세팅한다.
+
+main.c에서 join.c의 left_join_strategyB(left, right)를 호출해 조인을 수행한다.
+
+join.c의 left_join_strategyB()가 블록 크기/설정값을 검증하고 입력 크기 등을 기반으로 내부 처리 계획(필요 블록/레코드 수)을 잡는다.
+
+join.c가 필요한 큰 버퍼(LEFT/RIGHT 블록, 레코드 포인터 배열 등)를 memory.c의 big_alloc()으로 할당한다.
+
+join.c가 파티션 개수 P, I/O 버퍼 구성을 정하고, 추가 버퍼(iobuf, 파티션 경로/파일 배열 등)를 big_alloc()으로 확보한 뒤 남은 메모리로 memory.c의 arena_init()을 호출해 아레나(임시 메모리 풀)를 준비한다.
+
+join.c가 파티션용 임시 파일들을 열고, PHASE 1(Partition) 을 시작한다.
+
+join.c가 입력을 블록 단위로 읽기 위해 blockio.c의 fill_block()을 반복 호출해 레코드들을 블록에 적재한다.
+
+join.c가 각 레코드에서 조인 키를 뽑기 위해 blockio.c의 get_field()를 호출하고, hash(key) % P로 파티션을 결정한다.
+
+join.c가 결정된 파티션의 임시 파일(left_part[p], right_part[p])로 레코드를 기록해 LEFT/RIGHT를 각각 분할한다.
+
+join.c가 PHASE 2(Join) 를 시작하고, 파티션 p를 0부터 P-1까지 순회한다.
+
+RIGHT 파티션이 비어있으면 join.c가 LEFT 레코드에 대해 “매칭 없음(NULL)” 형태로 결과를 출력한다.
+
+RIGHT 파티션이 있으면 join.c가 arena_reset()으로 임시 메모리를 초기화하고, RIGHT 파티션을 읽으면서 해시 테이블을 구축한다.
+
+RIGHT 해시 테이블 구축 과정에서 join.c가 fill_block()/get_field()를 사용하고, 비키(non-key) 필드 문자열을 만들기 위해 blockio.c의 build_nonkey_fields()를 호출한다.
+
+해시 테이블 노드/문자열 저장은 memory.c의 arena_alloc()/arena_strdup()로 처리한다.
+
+join.c가 LEFT 파티션을 다시 fill_block()/get_field()로 읽으면서 해시 테이블을 프로브(probe)해 매칭을 찾는다.
+
+매칭이 있으면 join.c가 LEFT + RIGHT의 non-key를 합쳐 결과 파일(join.txt)에 출력한다.
+
+매칭이 없으면 join.c가 LEFT + NULLs 형태로 결과를 출력한다.
+
+모든 파티션 처리가 끝나면 join.c가 임시 파일을 닫고 삭제하며, 타이밍/블록 수 같은 메트릭을 정리해 main.c로 반환한다.
+
+main.c가 최종 통계(총 시간/단계별 시간/메모리 사용/블록 카운트 등)를 출력하고 종료한다.
